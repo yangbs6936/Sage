@@ -370,6 +370,7 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { cn } from '@/utils/cn'
+import { getAssetUrl } from '@/config/runtime.js'
 
 const router = useRouter()
 const route = useRoute()
@@ -391,7 +392,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['new-chat', 'collapse-change'])
-const logoUrl = computed(() => `${import.meta.env.BASE_URL}speaklyai_logo.svg`)
+const logoUrl = computed(() => getAssetUrl('speaklyai_logo.svg'))
 const observabilityProxyUrl = '/jaeger/'
 
 const currentUser = ref(getCurrentUser())

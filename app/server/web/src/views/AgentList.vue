@@ -362,6 +362,7 @@ import MarkdownRenderer from '../components/chat/MarkdownRenderer.vue'
 import { useAgentEditStore } from '../stores/agentEdit'
 import { normalizeAgentMode } from '../utils/agentMode.js'
 import { buildImportedAgentDraft, parseAgentConfigImport } from '../utils/agentConfigImport.js'
+import { getBackendEndpoint } from '../config/runtime.js'
 import { dump } from 'js-yaml'
 import AppConfirmDialog from '@/components/AppConfirmDialog.vue'
 import { Button } from '@/components/ui/button'
@@ -401,7 +402,7 @@ const agentToExport = ref(null)
 const showAuthModal = ref(false)
 const authAgentId = ref('')
 
-const { t, isZhCN } = useLanguage()
+const { t, isZhCN, language } = useLanguage()
 const route = useRoute()
 const currentUser = ref(getCurrentUser())
 const agentEditStore = useAgentEditStore()
@@ -411,6 +412,10 @@ watch(() => route.query.refresh, () => {
   if (currentView.value !== 'list') {
     handleBackToList()
   }
+})
+
+watch(language, () => {
+  loadAvailableTools()
 })
 
 const canEdit = (agent) => {
@@ -431,6 +436,10 @@ const handleToolsUpdated = () => {
   loadAvailableTools()
 }
 
+const getToolListLanguage = () => {
+  return language.value === 'enUS' ? 'en' : 'zh'
+}
+
 onMounted(async () => {
   await loadAgents()
   await loadModelProviders()
@@ -447,7 +456,7 @@ onUnmounted(() => {
 const loadAvailableTools = async () => {
   try {
     loading.value = true
-    const response = await toolAPI.getTools()
+    const response = await toolAPI.getTools({ language: getToolListLanguage() })
     if (response.tools) {
       tools.value = response.tools
     }
@@ -904,7 +913,7 @@ const openUsageModal = async (agent) => {
   }
 }
 
-const backendEndpoint = (import.meta.env.VITE_SAGE_API_BASE_URL || '').replace(/\/+$/, '')
+const backendEndpoint = getBackendEndpoint()
 
 const generateUsageCodes = (agent) => {
   const body = {

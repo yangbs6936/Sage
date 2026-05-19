@@ -14,6 +14,7 @@ from common.core import config
 from common.core.exceptions import SageHTTPException
 from common.core.middleware import register_cors_middleware, register_request_logging_middleware
 from common.core.render import Response
+from app.server.services.prometheus_metrics import finish_http_request, start_http_request
 from .auth import get_session_claims, parse_access_token
 
 # 白名单 API 路径
@@ -44,6 +45,7 @@ WHITELIST_API_PATHS = frozenset(
         "/api/observability/jaeger/login",
         "/api/observability/jaeger/auth",
         "/api/observability/jaeger/{full_path:path}",
+        "/api/observability/metrics",
         "/api/stream",
         "/api/chat",
         "/api/system/version/check",
@@ -61,11 +63,23 @@ def _compile_whitelist_regex(paths: frozenset[str]) -> Tuple[re.Pattern, ...]:
 
 
 WHITELIST_API_REGEXES = _compile_whitelist_regex(WHITELIST_API_PATHS)
+PROMETHEUS_HTTP_METRICS_IGNORED_PATHS = frozenset(
+    {
+        "/",
+        "/active",
+        "/api/health",
+        "/api/observability/metrics",
+    }
+)
 
 
 def _is_whitelisted(path: str) -> bool:
     """判断路径是否在白名单"""
     return path in WHITELIST_API_PATHS or any(r.match(path) for r in WHITELIST_API_REGEXES)
+
+
+def _should_record_prometheus_http_metrics(path: str) -> bool:
+    return path not in PROMETHEUS_HTTP_METRICS_IGNORED_PATHS
 
 
 def _is_trusted_identity_proxy(host: str | None, trusted_proxy_ips: list[str] | None) -> bool:
@@ -104,6 +118,19 @@ def register_middlewares(app):
     cfg = config.get_startup_config()
 
     register_cors_middleware(app)
+
+    @app.middleware("http")
+    async def prometheus_metrics_middleware(request: Request, call_next):
+        if not _should_record_prometheus_http_metrics(request.url.path):
+            return await call_next(request)
+        started_at, method, path = start_http_request(request.method, request.url.path)
+        status_code: int | str = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            finish_http_request(started_at, method, path, status_code)
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
