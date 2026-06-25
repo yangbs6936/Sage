@@ -14,6 +14,7 @@ def _empty_stats(*, request, workspace: Optional[str]) -> Dict[str, Any]:
         "session_id": getattr(request, "session_id", None),
         "user_id": getattr(request, "user_id", None),
         "agent_id": getattr(request, "agent_id", None),
+        "agent_name": getattr(request, "agent_name", None),
         "agent_mode": getattr(request, "agent_mode", None),
         "workspace": workspace,
         "requested_skills": list(getattr(request, "available_skills", None) or []),
@@ -38,7 +39,9 @@ def _empty_stats(*, request, workspace: Optional[str]) -> Dict[str, Any]:
     }
 
 
-def _record_stats_event(stats: Dict[str, Any], event: Dict[str, Any], start_time: float) -> None:
+def _record_stats_event(
+    stats: Dict[str, Any], event: Dict[str, Any], start_time: float
+) -> None:
     def _event_timestamp() -> float:
         timestamp = event.get("timestamp")
         if isinstance(timestamp, (int, float)):
@@ -61,7 +64,9 @@ def _record_stats_event(stats: Dict[str, Any], event: Dict[str, Any], start_time
                 "segment_count": 0,
             },
         )
-        totals["started_at"] = min(float(totals.get("started_at") or started_at), float(started_at))
+        totals["started_at"] = min(
+            float(totals.get("started_at") or started_at), float(started_at)
+        )
         totals["finished_at"] = max(
             float(totals.get("finished_at") or until_timestamp),
             float(until_timestamp),
@@ -107,12 +112,17 @@ def _record_stats_event(stats: Dict[str, Any], event: Dict[str, Any], start_time
         stats["_active_tool_steps"][key] = step
         stats["tool_steps"].append(step)
 
-    def _finish_tool_step(tool_call_id: Optional[str], tool_name: Optional[str]) -> None:
+    def _finish_tool_step(
+        tool_call_id: Optional[str], tool_name: Optional[str]
+    ) -> None:
         key = tool_call_id or ""
         step = stats["_active_tool_steps"].get(key) if key else None
         if step is None and tool_name:
             for candidate in reversed(stats["tool_steps"]):
-                if candidate.get("tool_name") == tool_name and candidate.get("status") == "running":
+                if (
+                    candidate.get("tool_name") == tool_name
+                    and candidate.get("status") == "running"
+                ):
                     step = candidate
                     break
         if step is None:
@@ -172,7 +182,9 @@ def _record_stats_event(stats: Dict[str, Any], event: Dict[str, Any], start_time
         buffer = (stats.get("_tool_tag_buffer") or "") + content
         stats["_tool_tag_buffer"] = buffer[-2048:]
 
-    tool_names = _collect_event_tool_names(event, content_buffer=stats.get("_tool_tag_buffer") or "")
+    tool_names = _collect_event_tool_names(
+        event, content_buffer=stats.get("_tool_tag_buffer") or ""
+    )
     if tool_names:
         has_visible_output = True
         existing_tool_names = set(stats["tools"])
@@ -214,7 +226,9 @@ def _record_stats_event(stats: Dict[str, Any], event: Dict[str, Any], start_time
             tool_name = event.get("tool_name")
         _finish_tool_step(
             str(tool_call_id).strip() or None if tool_call_id else None,
-            str(tool_name).strip() if isinstance(tool_name, str) and tool_name.strip() else None,
+            str(tool_name).strip()
+            if isinstance(tool_name, str) and tool_name.strip()
+            else None,
         )
 
     if event.get("type") == "token_usage":
@@ -285,6 +299,7 @@ def _print_stats(stats: Dict[str, Any], *, json_output: bool) -> None:
                     "session_id": stats.get("session_id"),
                     "user_id": stats.get("user_id"),
                     "agent_id": stats.get("agent_id"),
+                    "agent_name": stats.get("agent_name"),
                     "agent_mode": stats.get("agent_mode"),
                     "workspace": stats.get("workspace"),
                     "requested_skills": stats.get("requested_skills") or [],
@@ -314,6 +329,8 @@ def _print_stats(stats: Dict[str, Any], *, json_output: bool) -> None:
     ]
     if stats.get("agent_id"):
         output_lines.append(f"agent_id: {stats.get('agent_id')}")
+    if stats.get("agent_name"):
+        output_lines.append(f"agent_name: {stats.get('agent_name')}")
     if stats.get("workspace"):
         output_lines.append(f"workspace: {stats.get('workspace')}")
     first_output = stats.get("first_output_seconds")
@@ -361,8 +378,7 @@ def _print_stats(stats: Dict[str, Any], *, json_output: bool) -> None:
                 else str(step.get("status") or "unknown")
             )
             output_lines.append(
-                "  - "
-                f"#{step.get('step')} {step.get('tool_name')} ({duration_text})"
+                f"  - #{step.get('step')} {step.get('tool_name')} ({duration_text})"
             )
 
     phase_timings = stats.get("phase_timings") or []
@@ -398,4 +414,3 @@ def _snapshot_tool_steps(stats: Dict[str, Any]) -> Dict[str, str]:
             continue
         snapshot[_tool_step_event_key(step)] = str(step.get("status") or "")
     return snapshot
-

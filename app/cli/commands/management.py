@@ -1,5 +1,4 @@
 import argparse
-import json
 
 from app.cli.formatting import (
     _print_message_preview,
@@ -10,6 +9,8 @@ from app.cli.formatting import (
 
 
 async def doctor_command(args: argparse.Namespace) -> int:
+    import json
+
     from app.cli.service import collect_doctor_info, probe_default_provider
 
     info = collect_doctor_info()
@@ -37,6 +38,8 @@ async def doctor_command(args: argparse.Namespace) -> int:
 
 
 async def sessions_command(args: argparse.Namespace) -> int:
+    import json
+
     from app.cli.service import cli_db_runtime, inspect_session, list_sessions
 
     if args.sessions_command == "inspect":
@@ -59,8 +62,12 @@ async def sessions_command(args: argparse.Namespace) -> int:
         print(f"created_at: {result.get('created_at')}")
         print(f"user_count: {result.get('user_count')}")
         print(f"agent_count: {result.get('agent_count')}")
-        _print_message_preview(result.get("last_user_message"), label="last_user_message")
-        _print_message_preview(result.get("last_assistant_message"), label="last_assistant_message")
+        _print_message_preview(
+            result.get("last_user_message"), label="last_user_message"
+        )
+        _print_message_preview(
+            result.get("last_assistant_message"), label="last_assistant_message"
+        )
         messages = result.get("recent_messages") or []
         print(f"recent_messages: {len(messages)}")
         if not messages:
@@ -114,6 +121,8 @@ async def sessions_command(args: argparse.Namespace) -> int:
 
 
 async def skills_command(args: argparse.Namespace) -> int:
+    import json
+
     from app.cli.service import cli_db_runtime, list_available_skills
 
     if args.agent_id:
@@ -168,6 +177,8 @@ async def skills_command(args: argparse.Namespace) -> int:
 
 
 async def agents_command(args: argparse.Namespace) -> int:
+    import json
+
     from app.cli.service import cli_db_runtime, list_cli_agents
 
     async with cli_db_runtime(verbose=args.verbose):
@@ -197,6 +208,8 @@ async def agents_command(args: argparse.Namespace) -> int:
 
 
 def config_show_command(args: argparse.Namespace) -> int:
+    import json
+
     from app.cli.service import collect_config_info
 
     info = collect_config_info()
@@ -210,11 +223,32 @@ def config_show_command(args: argparse.Namespace) -> int:
             for sub_key, sub_value in value.items():
                 print(f"  {sub_key}: {sub_value}")
             continue
+        if isinstance(value, list):
+            print(f"{key}:")
+            if not value:
+                print("  (none)")
+                continue
+            for item in value:
+                if isinstance(item, dict):
+                    label = (
+                        item.get("alias")
+                        or item.get("name")
+                        or item.get("path")
+                        or item
+                    )
+                    print(f"  - {label}:")
+                    for sub_key, sub_value in item.items():
+                        print(f"      {sub_key}: {sub_value}")
+                else:
+                    print(f"  - {item}")
+            continue
         print(f"{key}: {value}")
     return 0
 
 
 def config_init_command(args: argparse.Namespace) -> int:
+    import json
+
     from app.cli.service import write_cli_config_file
 
     result = write_cli_config_file(path=args.path, force=args.force)
@@ -231,6 +265,8 @@ def config_init_command(args: argparse.Namespace) -> int:
 
 
 async def provider_command(args: argparse.Namespace) -> int:
+    import json
+
     from app.cli.service import (
         cli_db_runtime,
         create_cli_provider,
@@ -257,9 +293,13 @@ async def provider_command(args: argparse.Namespace) -> int:
         print(f"total: {result['total']}")
         filters = result.get("filters") or {}
         active_filters = [
-            f"default_only={filters.get('default_only')}" if filters.get("default_only") else None,
+            f"default_only={filters.get('default_only')}"
+            if filters.get("default_only")
+            else None,
             f"model={filters.get('model')}" if filters.get("model") else None,
-            f"name_contains={filters.get('name_contains')}" if filters.get("name_contains") else None,
+            f"name_contains={filters.get('name_contains')}"
+            if filters.get("name_contains")
+            else None,
         ]
         active_filters = [item for item in active_filters if item]
         if active_filters:
@@ -279,7 +319,9 @@ async def provider_command(args: argparse.Namespace) -> int:
 
     if args.provider_command == "inspect":
         async with cli_db_runtime(verbose=args.verbose):
-            result = await inspect_cli_provider(provider_id=args.provider_id, user_id=args.user_id)
+            result = await inspect_cli_provider(
+                provider_id=args.provider_id, user_id=args.user_id
+            )
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
@@ -317,7 +359,9 @@ async def provider_command(args: argparse.Namespace) -> int:
             )
     elif args.provider_command == "delete":
         async with cli_db_runtime(verbose=args.verbose):
-            result = await delete_cli_provider(provider_id=args.provider_id, user_id=args.user_id)
+            result = await delete_cli_provider(
+                provider_id=args.provider_id, user_id=args.user_id
+            )
     else:
         raise ValueError(f"Unsupported provider command: {args.provider_command}")
 

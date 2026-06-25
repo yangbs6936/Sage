@@ -11,16 +11,18 @@ from datetime import datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from loguru import logger
-from sqlalchemy.orm import query
 from sagents.context.session_context import delete_session_run_lock
 from sagents.utils.lock_manager import safe_release
 
+from common.core.context import get_request_locale
 from common.core.exceptions import SageHTTPException
+from common.core.i18n import t
 from common.core.request_identity import get_request_user_id
 from common.services import chat_service
 from common.services import conversation_service
 from common.schemas.chat import ChatRequest, StreamRequest, UserInputOptimizeRequest
-from app.server.services.prometheus_metrics import finish_operation, start_operation
+from app.server.services.prometheus_metrics import record_sse_stream_failure
+from app.server.utils.image_size_guard import ensure_image_url_within_size_limit
 from pydantic import BaseModel
 
 from ..services.chat.stream_manager import StreamManager
@@ -33,14 +35,14 @@ SERVER_STREAM_FILTERED_TYPES = {
 }
 
 
-def _resolve_request_language(http_request: Request, language: str | None = None, default: str = "zh") -> str:
+def _resolve_request_language(
+    http_request: Request, language: str | None = None, default: str = "zh"
+) -> str:
     candidate = (language or "").strip()
     if not candidate:
         headers = http_request.headers
         candidate = (
-            headers.get("x-accept-language")
-            or headers.get("accept-language")
-            or ""
+            headers.get("x-accept-language") or headers.get("accept-language") or ""
         ).strip()
     lowered = candidate.lower()
     if lowered.startswith("pt"):
@@ -67,6 +69,73 @@ def _build_current_time_with_weekday() -> str:
     return now.strftime("%a, %d %b %Y %H:%M:%S %z")
 
 
+def _extract_multimodal_image_url(item: object) -> str:
+    if not isinstance(item, dict) or item.get("type") != "image_url":
+        return ""
+
+    image_url = item.get("image_url")
+    if isinstance(image_url, dict):
+        return str(image_url.get("url") or "").strip()
+    if isinstance(image_url, str):
+        return image_url.strip()
+    return str(item.get("url") or "").strip()
+
+
+def _set_multimodal_image_url(item: dict, url: str) -> None:
+    image_url = item.get("image_url")
+    if isinstance(image_url, dict):
+        image_url["url"] = url
+    elif isinstance(image_url, str):
+        item["image_url"] = url
+    elif "url" in item:
+        item["url"] = url
+    else:
+        item["image_url"] = {"url": url}
+
+
+def _replace_multimodal_image_text_refs(
+    content: list,
+    old_url: str,
+    new_url: str,
+) -> None:
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "text":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and old_url in text:
+            item["text"] = text.replace(old_url, new_url)
+
+
+async def _guard_request_multimodal_images(
+    request: ChatRequest | StreamRequest,
+) -> None:
+    guarded_count = 0
+    for message in request.messages or []:
+        content = message.content
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            image_url = _extract_multimodal_image_url(item)
+            if not image_url:
+                continue
+            try:
+                guarded_url = await ensure_image_url_within_size_limit(image_url)
+            except Exception as exc:
+                logger.bind(session_id=request.session_id).warning(
+                    f"多模态图片压缩失败，保留原图: {exc}"
+                )
+                continue
+            if guarded_url != image_url and isinstance(item, dict):
+                _set_multimodal_image_url(item, guarded_url)
+                _replace_multimodal_image_text_refs(content, image_url, guarded_url)
+                guarded_count += 1
+
+    if guarded_count:
+        logger.bind(session_id=request.session_id).info(
+            f"多模态图片已压缩并替换 URL: count={guarded_count}"
+        )
+
+
 async def _start_web_stream_session(
     request: StreamRequest,
     *,
@@ -82,11 +151,13 @@ async def _start_web_stream_session(
         logger.bind(session_id=session_id).info(interrupt_message)
         try:
             await conversation_service.interrupt_session(
-                session_id,
+                session_id,  # pyright: ignore[reportArgumentType]
                 interrupt_message,
             )
         finally:
             await manager.stop_session(session_id)
+
+    await _guard_request_multimodal_images(request)
 
     await chat_service.populate_request_from_agent_config(
         request,
@@ -98,10 +169,15 @@ async def _start_web_stream_session(
     if filter_stream_types:
         generator = _filter_stream_chunks(generator)
 
-    await manager.start_session(session_id, query, generator, lock)
+    await manager.start_session(session_id, query, generator, lock)  # pyright: ignore[reportArgumentType]
 
     return StreamingResponse(
-        stream_with_manager(session_id, last_index=0, resume=False, stream_name=stream_name),
+        stream_with_manager(
+            session_id,  # pyright: ignore[reportArgumentType]
+            last_index=0,
+            resume=False,
+            stream_name=stream_name,
+        ),
         media_type="text/plain",
     )
 
@@ -130,7 +206,9 @@ async def optimize_chat_input(request: UserInputOptimizeRequest, http_request: R
 
 
 @chat_router.post("/api/chat/optimize-input/stream")
-async def optimize_chat_input_stream(request: UserInputOptimizeRequest, http_request: Request):
+async def optimize_chat_input_stream(
+    request: UserInputOptimizeRequest, http_request: Request
+):
     claims = getattr(http_request.state, "user_claims", {}) or {}
     if not request.user_id:
         request.user_id = claims.get("userid") or ""
@@ -139,7 +217,9 @@ async def optimize_chat_input_stream(request: UserInputOptimizeRequest, http_req
     async def event_generator():
         async for chunk in chat_service.optimize_user_input_stream(
             current_input=request.current_input,
-            history_messages=[message.model_dump() for message in request.history_messages],
+            history_messages=[
+                message.model_dump() for message in request.history_messages
+            ],
             session_id=request.session_id or "",
             agent_id=request.agent_id or "",
             user_id=request.user_id or "",
@@ -159,7 +239,6 @@ async def stream_with_manager(
     """
     通过 StreamManager 订阅会话流
     """
-    started_at, category, name = start_operation("stream", stream_name)
     status = "completed"
     manager = StreamManager.get_instance()
     has_stream_data = False
@@ -174,15 +253,18 @@ async def stream_with_manager(
         except Exception:
             status = "fallback_missing"
             return
-        yield json.dumps(
-            {
-                "type": "stream_end",
-                "session_id": session_id,
-                "timestamp": time.time(),
-                "resume_fallback": True,
-            },
-            ensure_ascii=False,
-        ) + "\n"
+        yield (
+            json.dumps(
+                {
+                    "type": "stream_end",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                    "resume_fallback": True,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
     except asyncio.CancelledError:
         status = "cancelled"
         raise
@@ -190,7 +272,7 @@ async def stream_with_manager(
         status = "error"
         raise
     finally:
-        finish_operation(started_at, category, name, status)
+        record_sse_stream_failure(stream_name, session_id, status)
 
 
 def _should_filter_stream_chunk(chunk: str) -> bool:
@@ -198,7 +280,10 @@ def _should_filter_stream_chunk(chunk: str) -> bool:
         payload = json.loads(chunk)
     except Exception:
         return False
-    return isinstance(payload, dict) and payload.get("type") in SERVER_STREAM_FILTERED_TYPES
+    return (
+        isinstance(payload, dict)
+        and payload.get("type") in SERVER_STREAM_FILTERED_TYPES
+    )
 
 
 async def _filter_stream_chunks(generator):
@@ -219,6 +304,25 @@ _DISCONNECT_INTERRUPT_TIMEOUT = 5.0
 _GENERATOR_ACLOSE_TIMEOUT = 5.0
 
 
+async def _wait_for_cleanup_step(
+    awaitable,
+    *,
+    timeout: float,
+    session_id: str,
+    timeout_message: str,
+    cancelled_message: str,
+    error_message: str,
+) -> None:
+    try:
+        await asyncio.wait_for(awaitable, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.bind(session_id=session_id).warning(timeout_message)
+    except asyncio.CancelledError:
+        logger.bind(session_id=session_id).warning(cancelled_message)
+    except Exception as ex:
+        logger.bind(session_id=session_id).warning(f"{error_message}: {ex}")
+
+
 async def stream_api_with_disconnect_check(
     generator,
     request: Request,
@@ -235,7 +339,6 @@ async def stream_api_with_disconnect_check(
     再 ``await`` 长协程（旧写法会在 generator 关闭临界态做远程持久化，叠加 anyio CancelScope
     导致 sage-server 主线程 100% CPU 空转）。改为 ``break`` 后统一在 ``finally`` 里收尾。
     """
-    started_at, category, name = start_operation("stream", stream_name)
     client_disconnected = False
     status = "completed"
     try:
@@ -256,29 +359,29 @@ async def stream_api_with_disconnect_check(
         raise
     finally:
         if client_disconnected:
-            try:
-                await asyncio.wait_for(
-                    conversation_service.interrupt_session(session_id, "客户端断开连接"),
-                    timeout=_DISCONNECT_INTERRUPT_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                logger.bind(session_id=session_id).warning(
-                    f"interrupt_session 超过 {_DISCONNECT_INTERRUPT_TIMEOUT}s 未返回，跳过强制等待"
-                )
-            except Exception as ex:
-                logger.bind(session_id=session_id).error(f"Error interrupting session: {ex}")
+            await _wait_for_cleanup_step(
+                conversation_service.interrupt_session(
+                    session_id,
+                    t("chat.client_disconnected", locale=get_request_locale()),
+                ),
+                timeout=_DISCONNECT_INTERRUPT_TIMEOUT,
+                session_id=session_id,
+                timeout_message=f"interrupt_session 超过 {_DISCONNECT_INTERRUPT_TIMEOUT}s 未返回，跳过强制等待",
+                cancelled_message="interrupt_session 清理阶段被取消，继续释放会话资源",
+                error_message="Error interrupting session",
+            )
 
         # 确保 generator 关闭，触发内部清理逻辑 (sagents cleanup)
         # 这必须在释放锁之前执行，因为 sagents 清理逻辑需要获取锁
-        try:
-            if hasattr(generator, "aclose"):
-                await asyncio.wait_for(generator.aclose(), timeout=_GENERATOR_ACLOSE_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.bind(session_id=session_id).warning(
-                f"generator.aclose 超过 {_GENERATOR_ACLOSE_TIMEOUT}s 未返回，跳过强制等待"
+        if hasattr(generator, "aclose"):
+            await _wait_for_cleanup_step(
+                generator.aclose(),
+                timeout=_GENERATOR_ACLOSE_TIMEOUT,
+                session_id=session_id,
+                timeout_message=f"generator.aclose 超过 {_GENERATOR_ACLOSE_TIMEOUT}s 未返回，跳过强制等待",
+                cancelled_message="generator.aclose 清理阶段被取消，继续释放会话资源",
+                error_message="Error closing generator",
             )
-        except Exception as e:
-            logger.bind(session_id=session_id).warning(f"Error closing generator: {e}")
 
         # 清理资源
         logger.bind(session_id=session_id).debug("流处理结束，清理会话资源")
@@ -289,7 +392,7 @@ async def stream_api_with_disconnect_check(
             logger.bind(session_id=session_id).info("资源已清理")
         except Exception as e:
             logger.bind(session_id=session_id).error(f"清理资源时发生错误: {e}")
-        finish_operation(started_at, category, name, status)
+        record_sse_stream_failure(stream_name, session_id, status)
 
 
 def validate_and_prepare_request(
@@ -299,14 +402,12 @@ def validate_and_prepare_request(
     allow_pending_guidance_flush: bool = False,
 ) -> None:
 
-
     # 验证请求参数
     if not request.messages or len(request.messages) == 0:
-        if (
-            not allow_pending_guidance_flush
-            or not _has_pending_user_injections(request.session_id)
+        if not allow_pending_guidance_flush or not _has_pending_user_injections(
+            request.session_id
         ):
-            raise SageHTTPException(detail="消息列表不能为空")
+            raise SageHTTPException(message_key="chat.messages_required")
         logger.bind(session_id=request.session_id).info(
             "允许空 messages 请求消费 pending guidance"
         )
@@ -316,6 +417,13 @@ def validate_and_prepare_request(
     req_user_id = claims.get("userid")
     if not request.user_id:
         request.user_id = req_user_id
+
+    provider_id = (request.provider_id or "").strip()
+    if provider_id:
+        request.provider_id = provider_id
+    fast_provider_id = (request.fast_provider_id or "").strip()
+    if fast_provider_id:
+        request.fast_provider_id = fast_provider_id
 
 
 def _has_pending_user_injections(session_id: str | None) -> bool:
@@ -341,6 +449,7 @@ async def chat(request: ChatRequest, http_request: Request):
         http_request,
         allow_pending_guidance_flush=True,
     )
+    await _guard_request_multimodal_images(request)
 
     # 构建 StreamRequest
     inner_request = StreamRequest(
@@ -349,6 +458,8 @@ async def chat(request: ChatRequest, http_request: Request):
         user_id=request.user_id,
         system_context=request.system_context,
         agent_id=request.agent_id,
+        provider_id=request.provider_id,
+        fast_provider_id=request.fast_provider_id,
     )
     chat_service.mark_request_execution(inner_request, request_source="api/chat")
 
@@ -368,7 +479,7 @@ async def chat(request: ChatRequest, http_request: Request):
             ),
             http_request,
             lock,
-            session_id,
+            session_id,  # pyright: ignore[reportArgumentType]
             stream_name="api_chat",
         ),
         media_type="text/plain",
@@ -379,6 +490,7 @@ async def chat(request: ChatRequest, http_request: Request):
 async def stream_chat(request: StreamRequest, http_request: Request):
     """流式聊天接口， 与chat不同的是入参不能够指定agent_id"""
     validate_and_prepare_request(request, http_request)
+    await _guard_request_multimodal_images(request)
     chat_service.mark_request_execution(request, request_source="api/stream")
     await chat_service.populate_request_from_agent_config(
         request,
@@ -394,7 +506,7 @@ async def stream_chat(request: StreamRequest, http_request: Request):
             ),
             http_request,
             lock,
-            session_id,
+            session_id,  # pyright: ignore[reportArgumentType]
             stream_name="api_stream",
         ),
         media_type="text/plain",
@@ -407,14 +519,13 @@ async def stream_chat_web(request: StreamRequest, http_request: Request):
     validate_and_prepare_request(request, http_request)
     chat_service.mark_request_execution(request, request_source="api/web-stream")
 
-    session_id = request.session_id
     manager = StreamManager.get_instance()
     query = request.messages[0].content
     return await _start_web_stream_session(
         request,
         manager=manager,
-        interrupt_message="同会话重入，先中断旧会话",
-        query=query,
+        interrupt_message=t("chat.interrupt_same_session", locale=get_request_locale()),
+        query=query,  # pyright: ignore[reportArgumentType]
         filter_stream_types=True,
         stream_name="web_stream",
     )
@@ -429,7 +540,12 @@ async def resume_stream(session_id: str, last_index: int = 0):
     """
 
     return StreamingResponse(
-        stream_with_manager(session_id, last_index, resume=True, stream_name="resume_stream"),
+        stream_with_manager(
+            session_id,
+            last_index,
+            resume=True,
+            stream_name="resume_stream",
+        ),
         media_type="text/plain",
     )
 
@@ -443,27 +559,22 @@ async def get_active_sessions(request: Request):
     client_host = request.client.host if request.client else "unknown"
 
     async def event_generator():
-        started_at, category, name = start_operation("stream", "active_sessions")
-        status = "completed"
         try:
             async for sessions in manager.subscribe_active_sessions():
                 if await request.is_disconnected():
-                    logger.info(f"Client {client_host} disconnected active_sessions stream")
-                    status = "disconnected"
+                    logger.info(
+                        f"Client {client_host} disconnected active_sessions stream"
+                    )
                     break
 
                 # 手动构建 SSE 格式
                 json_str = json.dumps(sessions, default=str, ensure_ascii=False)
                 yield f"data: {json_str}\n\n"
         except asyncio.CancelledError:
-            status = "cancelled"
             pass
         except Exception as e:
-            status = "error"
             logger.error(f"Error in SSE generator for {client_host}: {e}")
             raise
-        finally:
-            finish_operation(started_at, category, name, status)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -483,11 +594,13 @@ async def rerun_conversation_stream(
     guidance_content = (rerun_request.guidance_content or "").strip()
     rerun_messages = []
     if guidance_content:
-        rerun_messages.append({
-            "message_id": rerun_request.guidance_id or str(uuid.uuid4()),
-            "role": "user",
-            "content": guidance_content,
-        })
+        rerun_messages.append(
+            {
+                "message_id": rerun_request.guidance_id or str(uuid.uuid4()),
+                "role": "user",
+                "content": guidance_content,
+            }
+        )
 
     request = StreamRequest(
         messages=rerun_messages,
@@ -513,7 +626,9 @@ async def rerun_conversation_stream(
     return await _start_web_stream_session(
         request,
         manager=manager,
-        interrupt_message="重新执行最后一条用户消息，先中断旧会话",
+        interrupt_message=t(
+            "chat.interrupt_rerun_last_user", locale=get_request_locale()
+        ),
         query=guidance_content or payload["query"] or "",
         stream_name="rerun_stream",
     )

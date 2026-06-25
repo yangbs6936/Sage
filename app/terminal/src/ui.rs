@@ -2,28 +2,28 @@ use crate::app::{ActiveSurfaceKind, App};
 use crate::bottom_pane::command_popup;
 use crate::bottom_pane::{composer, footer, help_overlay, picker_overlay, transcript_overlay};
 use crate::custom_terminal::Frame;
+use crate::terminal_layout::INLINE_POPUP_MAX_ROWS;
 use crate::ui_support::{
-    composer_props, footer_props, help_overlay_props, live_region_height, picker_overlay_props,
-    render_live_region, transcript_overlay_props,
+    composer_props, footer_props, help_overlay_props, picker_overlay_props, render_live_region,
+    transcript_overlay_props,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let composer_props = composer_props(app);
-    let live_region_height = live_region_height(app, frame.area().width);
     let composer_height = composer::composer_height(&composer_props, frame.area().width);
     let popup_max_rows = frame
         .area()
         .height
-        .saturating_sub(live_region_height)
         .saturating_sub(composer_height)
         .saturating_sub(1) as usize;
+    let popup_max_rows = popup_max_rows.min(INLINE_POPUP_MAX_ROWS);
     let popup_props = app.popup_props_for_rows(popup_max_rows);
     let popup_height = command_popup::popup_height(popup_props.as_ref());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(live_region_height),
+            Constraint::Min(1),
             Constraint::Length(composer_height),
             Constraint::Length(popup_height),
             Constraint::Length(1),
@@ -72,7 +72,7 @@ mod tests {
         let _ = app.submit_input();
         app.set_active_phase("planning");
 
-        assert_eq!(footer_hint(&app), "planning... output is streaming");
+        assert_eq!(footer_hint(&app), "working: planning");
     }
 
     #[test]
@@ -106,7 +106,8 @@ mod tests {
 
         let hint = footer_hint(&app);
         assert!(hint.contains("running read_file"));
-        assert!(!hint.contains("planning..."));
+        assert!(hint.contains("tool"));
+        assert!(!hint.contains("working: planning"));
     }
 
     #[test]
@@ -117,7 +118,7 @@ mod tests {
         app.set_active_phase("planning");
         app.start_tool("search_memory".to_string());
 
-        assert_eq!(footer_hint(&app), "planning... output is streaming");
+        assert_eq!(footer_hint(&app), "working: planning");
     }
 
     #[test]
@@ -128,7 +129,7 @@ mod tests {
         let _ = app.submit_input();
         app.set_active_phase("assistant_text");
 
-        assert_eq!(footer_hint(&app), "assistant text... output is streaming");
+        assert_eq!(footer_hint(&app), "working: assistant text");
     }
 
     #[test]
@@ -138,5 +139,14 @@ mod tests {
         let _ = app.submit_input();
 
         assert_eq!(footer_hint(&app), "working... output is streaming");
+    }
+
+    #[test]
+    fn footer_summary_includes_default_sandbox_context() {
+        let app = App::new();
+
+        let summary = footer_status_summary(&app);
+
+        assert!(summary.contains("sandbox default"));
     }
 }

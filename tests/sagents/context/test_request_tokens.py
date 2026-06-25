@@ -3,6 +3,7 @@
 只验证 start_request / add_llm_request / end_request 三件套的核心流转，
 不依赖沙箱与异步初始化。
 """
+
 import json
 import os
 import asyncio
@@ -124,7 +125,7 @@ def test_session_context_save_runs_when_status_changes(tmp_path):
     ctx = _make_session(tmp_path)
 
     ctx.save(session_status=ctx.status)
-    ctx.save(session_status="interrupted", interrupt_reason="客户端断开连接")
+    ctx.save(session_status="interrupted", interrupt_reason="客户端断开连接")  # pyright: ignore[reportArgumentType]
 
     session_end_events = [
         event

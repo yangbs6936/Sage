@@ -2,9 +2,9 @@
 Agent 相关路由
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from common.core.request_identity import (
@@ -19,6 +19,7 @@ from common.schemas.agent import (
     AgentConfigDTO,
     AutoGenAgentRequest,
     DeleteAgentWorkspaceRequest,
+    FileWorkspaceStatRequest,
     AuthorizationRequest,
     SystemPromptOptimizeRequest,
     convert_agent_to_config,
@@ -32,14 +33,14 @@ from loguru import logger
 agent_router = APIRouter(prefix="/api/agent", tags=["Agent"])
 
 
-def _resolve_request_language(http_request: Request, language: Optional[str] = None, default: str = "en") -> str:
+def _resolve_request_language(
+    http_request: Request, language: Optional[str] = None, default: str = "en"
+) -> str:
     candidate = (language or "").strip()
     if not candidate:
         headers = http_request.headers
         candidate = (
-            headers.get("x-accept-language")
-            or headers.get("accept-language")
-            or ""
+            headers.get("x-accept-language") or headers.get("accept-language") or ""
         ).strip()
     lowered = candidate.lower()
     if lowered.startswith("pt"):
@@ -63,7 +64,9 @@ async def list(http_request: Request):
     all_configs = await agent_service.list_agents(target_user_id)
     agents_data = serialize_agents(all_configs)
     return await Response.succ(
-        data=agents_data, message=f"成功获取 {len(agents_data)} 个Agent"
+        data=agents_data,
+        message="agent.list_loaded",
+        message_params={"count": len(agents_data)},
     )
 
 
@@ -79,14 +82,17 @@ async def get_default_system_prompt(http_request: Request, language: str = "en")
         StandardResponse: 包含默认System Prompt的内容
     """
     try:
-        resolved_language = _resolve_request_language(http_request, language, default="zh")
+        resolved_language = _resolve_request_language(
+            http_request, language, default="zh"
+        )
         result = await agent_router_service.build_default_system_prompt_response(
             language=resolved_language,
         )
         return await Response.succ(data=result["data"], message=result["message"])
     except Exception as e:
         return await Response.error(
-            message=f"获取默认System Prompt模板失败: {str(e)}"
+            message="agent.default_prompt_failed",
+            message_params={"message": str(e)},
         )
 
 
@@ -108,7 +114,9 @@ async def create(agent: AgentConfigDTO, http_request: Request):
         user_id,
     )
     return await Response.succ(
-        data={"agent_id": created_agent.agent_id}, message=f"Agent '{created_agent.agent_id}' 创建成功"
+        data={"agent_id": created_agent.agent_id},
+        message="agent.created",
+        message_params={"agent_id": created_agent.agent_id},
     )
 
 
@@ -126,7 +134,9 @@ async def get(agent_id: str, http_request: Request):
     target_user_id = get_target_user_id_for_role(http_request)
     agent = await agent_service.get_agent(agent_id, target_user_id)
     return await Response.succ(
-        data=serialize_agent(agent), message=f"获取Agent '{agent_id}' 成功"
+        data=serialize_agent(agent),
+        message="agent.loaded",
+        message_params={"agent_id": agent_id},
     )
 
 
@@ -150,7 +160,9 @@ async def update(agent_id: str, agent: AgentConfigDTO, http_request: Request):
         role,
     )
     return await Response.succ(
-        data={"agent_id": agent_id}, message=f"Agent '{agent_id}' 更新成功"
+        data={"agent_id": agent_id},
+        message="agent.updated",
+        message_params={"agent_id": agent_id},
     )
 
 
@@ -167,7 +179,9 @@ async def delete(agent_id: str, http_request: Request):
     role = get_request_role(http_request)
     await agent_service.delete_agent(agent_id, user_id, role)
     return await Response.succ(
-        data={"agent_id": agent_id}, message=f"Agent '{agent_id}' 删除成功"
+        data={"agent_id": agent_id},
+        message="agent.deleted",
+        message_params={"agent_id": agent_id},
     )
 
 
@@ -259,7 +273,7 @@ async def get_task(task_id: str, http_request: Request):
     from common.services.async_task_service import get_async_task_service
 
     task = await get_async_task_service().get(task_id, user_id)
-    return await Response.succ(data=task, message="获取任务状态成功")
+    return await Response.succ(data=task, message="agent.task_status_loaded")
 
 
 @agent_router.post("/tasks/{task_id}/cancel")
@@ -268,7 +282,7 @@ async def cancel_task(task_id: str, http_request: Request):
     from common.services.async_task_service import get_async_task_service
 
     task = await get_async_task_service().cancel(task_id, user_id)
-    return await Response.succ(data=task, message="任务取消请求已提交")
+    return await Response.succ(data=task, message="agent.task_cancel_requested")
 
 
 @agent_router.get("/{agent_id}/auth")
@@ -278,9 +292,9 @@ async def get_auth(agent_id: str, http_request: Request):
     """
     user_id = get_request_user_id(http_request)
     role = get_request_role(http_request)
-    
+
     users = await agent_service.get_agent_authorized_users(agent_id, user_id, role)
-    return await Response.succ(data=users, message="获取授权用户列表成功")
+    return await Response.succ(data=users, message="agent.auth_users_loaded")
 
 
 @agent_router.post("/{agent_id}/auth")
@@ -290,9 +304,12 @@ async def update_auth(agent_id: str, req: AuthorizationRequest, http_request: Re
     """
     user_id = get_request_user_id(http_request)
     role = get_request_role(http_request)
-    
-    await agent_service.update_agent_authorizations(agent_id, req.user_ids, user_id, role)
-    return await Response.succ(data={}, message="更新授权成功")
+
+    await agent_service.update_agent_authorizations(
+        agent_id, req.user_ids, user_id, role
+    )
+    return await Response.succ(data={}, message="agent.auth_updated")
+
 
 @agent_router.post("/{agent_id}/file_workspace")
 async def get_workspace(
@@ -326,8 +343,11 @@ async def get_workspace(
     logger.bind(agent_id=agent_id).info(f"获取工作空间文件数量：{len(files)}")
     return await Response.succ(message=result["message"], data=result["data"])
 
+
 @agent_router.get("/{agent_id}/file_workspace/download")
-async def download_file(agent_id: str, request: Request, session_id: Optional[str] = None):
+async def download_file(
+    agent_id: str, request: Request, session_id: Optional[str] = None
+):
     """获取指定会话的文件工作空间"""
     user_id = get_request_user_id(request)
     role = get_request_role(request)
@@ -337,46 +357,117 @@ async def download_file(agent_id: str, request: Request, session_id: Optional[st
         conversation = await dao.get_by_session_id(session_id)
         if conversation:
             user_id = conversation.user_id
-            
+
     file_path = request.query_params.get("file_path")
     logger.info(f"Download request: file_path={file_path}")
     try:
         path, filename, media_type = await agent_service.download_server_agent_file(
             agent_id,
             user_id,
-            file_path,
+            file_path,  # pyright: ignore[reportArgumentType]
         )
         logger.info(f"Download resolved: path={path}")
-        return FileResponse(
-            path=path, filename=filename, media_type=media_type
-        )
+        return FileResponse(path=path, filename=filename, media_type=media_type)
     except Exception as e:
         logger.error(f"Download failed: {e}")
         raise
 
 
-@agent_router.delete("/{agent_id}/file_workspace/delete")
-async def delete_file(agent_id: str, request: Request, session_id: Optional[str] = None):
-    """删除指定会话的文件"""
+@agent_router.post("/{agent_id}/file_workspace/stat")
+async def stat_files(
+    agent_id: str,
+    body: FileWorkspaceStatRequest,
+    request: Request,
+    session_id: Optional[str] = None,
+):
     user_id = get_request_user_id(request)
     role = get_request_role(request)
-    
+
     if role == "admin" and session_id:
         dao = ConversationDao()
         conversation = await dao.get_by_session_id(session_id)
         if conversation:
             user_id = conversation.user_id
-            
+
+    result = await agent_service.stat_server_agent_files(
+        agent_id,
+        user_id,
+        body.paths,
+        session_id=session_id,
+    )
+    return await Response.succ(message="agent.file_metadata_loaded", data=result)
+
+
+@agent_router.delete("/{agent_id}/file_workspace/delete")
+async def delete_file(
+    agent_id: str, request: Request, session_id: Optional[str] = None
+):
+    """删除指定会话的文件"""
+    user_id = get_request_user_id(request)
+    role = get_request_role(request)
+
+    if role == "admin" and session_id:
+        dao = ConversationDao()
+        conversation = await dao.get_by_session_id(session_id)
+        if conversation:
+            user_id = conversation.user_id
+
     file_path = request.query_params.get("file_path")
     logger.info(f"Delete request: file_path={file_path}")
     try:
         result = await agent_router_service.build_workspace_delete_response(
-            file_path=file_path,
-            deleter=lambda: agent_service.delete_server_agent_file(agent_id, user_id, file_path),
+            file_path=file_path,  # pyright: ignore[reportArgumentType]
+            deleter=lambda: agent_service.delete_server_agent_file(
+                agent_id,
+                user_id,
+                file_path,  # pyright: ignore[reportArgumentType]
+            ),
         )
         return await Response.succ(message=result["message"], data=result["data"])
     except Exception as e:
         logger.error(f"Delete failed: {e}")
+        raise
+
+
+@agent_router.post("/{agent_id}/file_workspace/upload")
+async def upload_file(
+    agent_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    target_path: str = Form(""),
+    session_id: Optional[str] = None,
+):
+    """上传文件到 Agent 工作空间"""
+    user_id = get_request_user_id(request)
+    role = get_request_role(request)
+
+    if role == "admin" and session_id:
+        dao = ConversationDao()
+        conversation = await dao.get_by_session_id(session_id)
+        if conversation:
+            user_id = conversation.user_id
+
+    logger.bind(agent_id=agent_id, user_id=user_id).info(
+        f"Upload request: filename={file.filename}, target_path={target_path}"
+    )
+    try:
+        result = await agent_service.upload_server_agent_file(
+            agent_id,
+            user_id,
+            file.filename,  # pyright: ignore[reportArgumentType]
+            file.file,
+            target_path,
+        )
+        logger.bind(agent_id=agent_id, user_id=user_id).info(
+            f"Upload successful: path={result['path']}, size={result['size']}"
+        )
+        return await Response.succ(
+            message="agent.file_uploaded",
+            message_params={"filename": file.filename},
+            data=result,
+        )
+    except Exception as e:
+        logger.bind(agent_id=agent_id, user_id=user_id).error(f"Upload failed: {e}")
         raise
 
 
@@ -390,6 +481,8 @@ async def delete_agent_workspace(req: DeleteAgentWorkspaceRequest):
     result = await agent_router_service.build_agent_workspace_delete_response(
         agent_id=req.agent_id,
         user_id=req.user_id,
-        deleter=lambda: agent_service.delete_server_agent_workspace(req.agent_id, req.user_id),
+        deleter=lambda: agent_service.delete_server_agent_workspace(
+            req.agent_id, req.user_id
+        ),
     )
     return await Response.succ(message=result["message"], data=result["data"])

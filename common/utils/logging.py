@@ -15,12 +15,13 @@ import re
 import sys
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from loguru import logger
 
 
 _SUPPRESSED_UVICORN_ACCESS_PATHS = {
+    "/api/health",
     "/api/observability/metrics",
 }
 
@@ -87,9 +88,13 @@ class InterceptHandler(logging.Handler):
             level = "DEBUG"
         if record_name.startswith("httpx") and level == "INFO":
             level = "DEBUG"
-        if ("httptools_impl" in normalized_path or "httptools_impl" in record_filename) and level == "INFO":
+        if (
+            "httptools_impl" in normalized_path or "httptools_impl" in record_filename
+        ) and level == "INFO":
             level = "DEBUG"
-        if ("streamable_http" in normalized_path or "streamable_http" in record_filename) and level == "INFO":
+        if (
+            "streamable_http" in normalized_path or "streamable_http" in record_filename
+        ) and level == "INFO":
             level = "DEBUG"
 
         # Find caller
@@ -102,12 +107,15 @@ class InterceptHandler(logging.Handler):
             depth += 1
 
         payload = {"logger_name": record.name}
-        if hasattr(record, "session_id") and getattr(record, "session_id") != "NO_SESSION":
-            payload["session_id"] = record.session_id
+        if (
+            hasattr(record, "session_id")
+            and getattr(record, "session_id") != "NO_SESSION"
+        ):
+            payload["session_id"] = record.session_id  # pyright: ignore[reportAttributeAccessIssue]
         if hasattr(record, "caller_filename"):
-            payload["file.name"] = record.caller_filename
+            payload["file.name"] = record.caller_filename  # pyright: ignore[reportAttributeAccessIssue]
         if hasattr(record, "caller_lineno"):
-            payload["line"] = record.caller_lineno
+            payload["line"] = record.caller_lineno  # pyright: ignore[reportAttributeAccessIssue]
 
         _ensure_loguru_has_sink()
         try:
@@ -211,7 +219,7 @@ def init_logging_base(
 
         record["message"] = formatting_payload(record)
 
-    logger.configure(patcher=patcher)
+    logger.configure(patcher=patcher)  # pyright: ignore[reportArgumentType]
 
     # stdout sink
     stdout_sink: Any = SafeStdout() if use_safe_stdout else sys.stdout
@@ -244,9 +252,11 @@ def init_logging_base(
     logger.add(
         log_dir / f"{log_name}_access.log",
         level="INFO",
-        filter=lambda record: "REQUEST_START" in record["message"]
-        or "REQUEST_END" in record["message"]
-        or record["extra"].get("logger_name") == "uvicorn.access",
+        filter=lambda record: (
+            "REQUEST_START" in record["message"]
+            or "REQUEST_END" in record["message"]
+            or record["extra"].get("logger_name") == "uvicorn.access"
+        ),
         **access_params,
     )
 

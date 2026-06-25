@@ -20,7 +20,9 @@ from sagents.session_runtime import (
 )
 
 from common.core import config
+from common.core.context import get_request_locale
 from common.core.exceptions import SageHTTPException
+from common.core.i18n import t
 from common.models.base import get_local_now
 from common.models.conversation import Conversation, ConversationDao
 from common.schemas.conversation import ConversationInfo
@@ -42,13 +44,19 @@ def _is_desktop_mode() -> bool:
 
 
 def _conversation_error_kwargs(
-    detail: str,
-    error_detail: str,
+    detail: str = "",
+    error_detail: str = "",
+    message_key: str | None = None,
+    message_params: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
         "detail": detail,
         "error_detail": error_detail,
     }
+    if message_key:
+        kwargs["message_key"] = message_key
+    if message_params:
+        kwargs["message_params"] = message_params
     if _is_desktop_mode():
         kwargs["status_code"] = 500
     return kwargs
@@ -91,7 +99,7 @@ def inject_user_message(
     from sagents import SAgent
 
     if isinstance(content, str) and not content.strip():
-        raise SageHTTPException(detail="content 不能为空")
+        raise SageHTTPException(message_key="conversation.content_required")
     sage_engine = SAgent(session_root_space=str(get_sessions_root()))
     try:
         gid = sage_engine.inject_user_message(
@@ -104,7 +112,7 @@ def inject_user_message(
         logger.bind(session_id=session_id).info(f"注入引导消息失败: {exc}")
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail="会话不存在或已结束，无法注入引导消息",
+                message_key="conversation.session_not_active_for_inject",
                 error_detail=str(exc),
             )
         )
@@ -118,6 +126,7 @@ def inject_user_message(
 
 def _build_inject_sage_engine():
     from sagents import SAgent
+
     return SAgent(session_root_space=str(get_sessions_root()))
 
 
@@ -125,7 +134,7 @@ def _raise_inject_lookup_error(session_id: str, exc: Exception) -> None:
     logger.bind(session_id=session_id).info(f"引导消息操作失败: {exc}")
     raise SageHTTPException(
         **_conversation_error_kwargs(
-            detail="会话不存在或已结束，无法操作引导消息",
+            message_key="conversation.session_not_active_for_guidance",
             error_detail=str(exc),
         )
     )
@@ -148,9 +157,9 @@ def update_pending_user_injection(
 ) -> Dict[str, Any]:
     """编辑指定 pending 引导消息。"""
     if not guidance_id:
-        raise SageHTTPException(detail="guidance_id 不能为空")
+        raise SageHTTPException(message_key="conversation.guidance_id_required")
     if isinstance(content, str) and not content.strip():
-        raise SageHTTPException(detail="content 不能为空")
+        raise SageHTTPException(message_key="conversation.content_required")
     sage_engine = _build_inject_sage_engine()
     try:
         hit = sage_engine.update_pending_user_injection(
@@ -164,7 +173,8 @@ def update_pending_user_injection(
         raise SageHTTPException(detail=str(exc))
     if not hit:
         raise SageHTTPException(
-            detail=f"未找到 guidance_id={guidance_id} 的 pending 引导消息（可能已被消费或已删除）"
+            message_key="conversation.guidance_not_found",
+            message_params={"guidance_id": guidance_id},
         )
     return {"session_id": session_id, "guidance_id": guidance_id, "updated": True}
 
@@ -175,7 +185,7 @@ def delete_pending_user_injection(
 ) -> Dict[str, Any]:
     """删除指定 pending 引导消息。"""
     if not guidance_id:
-        raise SageHTTPException(detail="guidance_id 不能为空")
+        raise SageHTTPException(message_key="conversation.guidance_id_required")
     sage_engine = _build_inject_sage_engine()
     try:
         hit = sage_engine.delete_pending_user_injection(
@@ -186,7 +196,8 @@ def delete_pending_user_injection(
         _raise_inject_lookup_error(session_id, exc)
     if not hit:
         raise SageHTTPException(
-            detail=f"未找到 guidance_id={guidance_id} 的 pending 引导消息（可能已被消费或已删除）"
+            message_key="conversation.guidance_not_found",
+            message_params={"guidance_id": guidance_id},
         )
     return {"session_id": session_id, "guidance_id": guidance_id, "deleted": True}
 
@@ -210,13 +221,19 @@ async def interrupt_session(
     stream_managers = []
     try:
         if _is_desktop_mode():
-            from app.desktop.core.services.chat.stream_manager import StreamManager as DesktopStreamManager
+            from app.desktop.core.services.chat.stream_manager import (
+                StreamManager as DesktopStreamManager,
+            )
+
             stream_managers.append(DesktopStreamManager.get_instance())
     except Exception as e:
         logger.bind(session_id=session_id).debug(f"无法加载 desktop StreamManager: {e}")
 
     try:
-        from common.services.chat_stream_manager import StreamManager as CommonStreamManager
+        from common.services.chat_stream_manager import (
+            StreamManager as CommonStreamManager,
+        )
+
         stream_managers.append(CommonStreamManager.get_instance())
     except Exception as e:
         logger.bind(session_id=session_id).debug(f"无法加载 common StreamManager: {e}")
@@ -236,7 +253,9 @@ async def interrupt_session(
                 f"{session_id}__questionnaire__"
             )
         except Exception as e:
-            logger.bind(session_id=session_id).warning(f"中断会话时更新问卷状态失败: {e}")
+            logger.bind(session_id=session_id).warning(
+                f"中断会话时更新问卷状态失败: {e}"
+            )
 
     logger.bind(session_id=session_id).info("会话中断成功")
     return {"session_id": session_id}
@@ -285,7 +304,9 @@ async def persist_session_state_with_cancel_protection(session_id: str) -> None:
     try:
         await asyncio.shield(persistence_task)
     except asyncio.CancelledError as cancel_exc:
-        logger.bind(session_id=session_id).warning("会话持久化遇到取消，转入后台继续完成")
+        logger.bind(session_id=session_id).warning(
+            "会话持久化遇到取消，转入后台继续完成"
+        )
         if not persistence_task.done():
             persistence_task.add_done_callback(
                 lambda task: _log_background_persistence_result(session_id, task)
@@ -308,7 +329,8 @@ async def get_session_status(session_id: str) -> Dict[str, Any]:
     if not session:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail=f"会话 {session_id} 已完成或者不存在",
+                message_key="conversation.completed_or_not_found",
+                message_params={"session_id": session_id},
                 error_detail=f"Session '{session_id}' completed or not found",
             )
         )
@@ -331,6 +353,7 @@ async def get_conversations_paginated(
     search: Optional[str] = None,
     agent_id: Optional[str] = None,
     sort_by: str = "date",
+    include_messages: bool = True,
 ) -> Tuple[List[Conversation], int]:
     dao = ConversationDao()
     return await dao.get_conversations_paginated(
@@ -340,6 +363,7 @@ async def get_conversations_paginated(
         search=search,
         agent_id=agent_id,
         sort_by=sort_by or "date",
+        include_messages=include_messages,
     )
 
 
@@ -351,10 +375,21 @@ def build_conversation_list_result(
     page_size: int,
     include_user_id: bool = False,
     context_user_id: Optional[str] = None,
+    include_message_counts: bool = True,
 ) -> Dict[str, Any]:
     conversation_items: List[ConversationInfo] = []
     for conv in conversations:
-        message_count = conv.get_message_count()
+        if include_message_counts:
+            message_count = conv.get_message_count()
+            total_messages = message_count.get("user_count", 0) + message_count.get(
+                "agent_count", 0
+            )
+            user_count = message_count.get("user_count", 0)
+            agent_count = message_count.get("agent_count", 0)
+        else:
+            total_messages = 0
+            user_count = 0
+            agent_count = 0
         trace_id = _build_session_trace_id(conv.session_id)
         trace_url = _build_session_trace_url(conv.session_id)
         conversation_items.append(
@@ -364,9 +399,9 @@ def build_conversation_list_result(
                 agent_id=conv.agent_id,
                 agent_name=conv.agent_name,
                 title=conv.title,
-                message_count=message_count.get("user_count", 0) + message_count.get("agent_count", 0),
-                user_count=message_count.get("user_count", 0),
-                agent_count=message_count.get("agent_count", 0),
+                message_count=total_messages,
+                user_count=user_count,
+                agent_count=agent_count,
                 created_at=conv.created_at.isoformat() if conv.created_at else "",
                 updated_at=conv.updated_at.isoformat() if conv.updated_at else "",
                 trace_id=trace_id,
@@ -397,7 +432,8 @@ async def get_conversation_messages(
     if not conversation:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail=f"会话 {session_id} 不存在",
+                message_key="conversation.not_found",
+                message_params={"session_id": session_id},
                 error_detail=f"Conversation '{session_id}' not found",
             )
         )
@@ -407,7 +443,9 @@ async def get_conversation_messages(
         if _is_desktop_mode()
         else "app.server.services.chat.stream_manager"
     )
-    stream_manager = __import__(stream_manager_module, fromlist=["StreamManager"]).StreamManager
+    stream_manager = __import__(
+        stream_manager_module, fromlist=["StreamManager"]
+    ).StreamManager
 
     view = build_conversation_messages_view(session_id)
     messages: List[Dict[str, Any]] = []
@@ -440,7 +478,8 @@ async def delete_conversation(
     if not conversation:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail=f"会话 {conversation_id} 不存在",
+                message_key="conversation.not_found",
+                message_params={"session_id": conversation_id},
                 error_detail=f"Conversation '{conversation_id}' not found",
             )
         )
@@ -448,7 +487,7 @@ async def delete_conversation(
     if user_id and conversation.user_id and conversation.user_id != user_id:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail="无权删除该会话",
+                message_key="conversation.delete_forbidden",
                 error_detail="forbidden",
             )
         )
@@ -457,7 +496,8 @@ async def delete_conversation(
     if not success:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail=f"删除会话 {conversation_id} 失败",
+                message_key="conversation.delete_failed",
+                message_params={"session_id": conversation_id},
                 error_detail=f"Failed to delete conversation '{conversation_id}'",
             )
         )
@@ -470,7 +510,7 @@ def _resolve_session_directory(session_id: str) -> Path:
     if not safe_session_id or Path(safe_session_id).name != safe_session_id:
         raise SageHTTPException(
             status_code=400,
-            detail="session_id 不合法",
+            message_key="conversation.session_id_invalid",
             error_detail="Invalid session_id",
         )
 
@@ -481,14 +521,15 @@ def _resolve_session_directory(session_id: str) -> Path:
     except ValueError:
         raise SageHTTPException(
             status_code=400,
-            detail="session_id 不合法",
+            message_key="conversation.session_id_invalid",
             error_detail="Session path escapes sessions root",
         )
 
     if not session_dir.is_dir():
         raise SageHTTPException(
             status_code=404,
-            detail=f"会话文件夹 {safe_session_id} 不存在",
+            message_key="conversation.folder_not_found",
+            message_params={"session_id": safe_session_id},
             error_detail=f"Session directory '{safe_session_id}' not found",
         )
     return session_dir
@@ -532,7 +573,7 @@ async def prepare_session_folder_download(
     if not is_admin:
         raise SageHTTPException(
             status_code=403,
-            detail="仅管理员可以下载会话文件夹",
+            message_key="conversation.download_admin_required",
             error_detail="admin_required",
         )
 
@@ -541,12 +582,15 @@ async def prepare_session_folder_download(
     if not conversation:
         raise SageHTTPException(
             status_code=404,
-            detail=f"会话 {session_id} 不存在",
+            message_key="conversation.not_found",
+            message_params={"session_id": session_id},
             error_detail=f"Conversation '{session_id}' not found",
         )
 
     session_dir = _resolve_session_directory(session_id)
-    archive_path = await asyncio.to_thread(_build_session_archive_sync, session_dir, session_id)
+    archive_path = await asyncio.to_thread(
+        _build_session_archive_sync, session_dir, session_id
+    )
     return archive_path, f"{session_id}.zip", "application/zip"
 
 
@@ -559,7 +603,8 @@ async def update_server_conversation_title(
     success = await dao.update_title(session_id, title)
     if not success:
         raise SageHTTPException(
-            detail=f"会话 {session_id} 不存在",
+            message_key="conversation.not_found",
+            message_params={"session_id": session_id},
             error_detail=f"Conversation '{session_id}' not found",
         )
     return {"session_id": session_id, "title": title}
@@ -571,7 +616,9 @@ def _get_stream_manager():
         if _is_desktop_mode()
         else "app.server.services.chat.stream_manager"
     )
-    return __import__(stream_manager_module, fromlist=["StreamManager"]).StreamManager.get_instance()
+    return __import__(
+        stream_manager_module, fromlist=["StreamManager"]
+    ).StreamManager.get_instance()
 
 
 def _load_session_raw_messages(session_id: str) -> List[Dict[str, Any]]:
@@ -584,7 +631,9 @@ def _load_session_raw_messages(session_id: str) -> List[Dict[str, Any]]:
                 if raw_messages:
                     return [message.to_dict() for message in raw_messages]
         except Exception as exc:
-            logger.bind(session_id=session_id).warning(f"读取 session 原始消息失败，回退数据库: {exc}")
+            logger.bind(session_id=session_id).warning(
+                f"读取 session 原始消息失败，回退数据库: {exc}"
+            )
     return []
 
 
@@ -601,7 +650,11 @@ def _replace_message_text_content(existing_content: Any, new_text: str) -> Any:
         updated_items: List[Dict[str, Any]] = []
         text_replaced = False
         for item in existing_content:
-            if isinstance(item, dict) and item.get("type") == "text" and not text_replaced:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and not text_replaced
+            ):
                 updated_items.append({**item, "text": text})
                 text_replaced = True
                 continue
@@ -632,12 +685,14 @@ def _truncate_messages_after_last_user(
     if last_user_index < 0:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail="会话中不存在可编辑的用户消息",
+                message_key="conversation.no_editable_user_message",
                 error_detail="No editable user message found",
             )
         )
 
-    truncated_messages = [dict(message or {}) for message in messages[: last_user_index + 1]]
+    truncated_messages = [
+        dict(message or {}) for message in messages[: last_user_index + 1]
+    ]
     last_user_message = dict(truncated_messages[last_user_index] or {})
     last_user_message["content"] = _replace_message_text_content(
         last_user_message.get("content"),
@@ -647,7 +702,9 @@ def _truncate_messages_after_last_user(
     return truncated_messages, last_user_message
 
 
-def _session_workspace_file_paths(session_id: str) -> Tuple[Optional[Path], Path, Path, Path]:
+def _session_workspace_file_paths(
+    session_id: str,
+) -> Tuple[Optional[Path], Path, Path, Path]:
     sessions_root = Path(get_sessions_root())
     manager = get_global_session_manager()
     workspace_path: Optional[Path] = None
@@ -665,7 +722,9 @@ def _session_workspace_file_paths(session_id: str) -> Tuple[Optional[Path], Path
 
 
 def _write_session_files(session_id: str, messages: List[Dict[str, Any]]) -> None:
-    workspace_path, messages_path, context_path, tools_usage_path = _session_workspace_file_paths(session_id)
+    workspace_path, messages_path, context_path, tools_usage_path = (
+        _session_workspace_file_paths(session_id)
+    )
     if not workspace_path:
         return
 
@@ -679,7 +738,9 @@ def _write_session_files(session_id: str, messages: List[Dict[str, Any]]) -> Non
             with open(context_path, "r", encoding="utf-8") as f:
                 context_data = json.load(f)
         except Exception as exc:
-            logger.bind(session_id=session_id).warning(f"读取 session_context.json 失败，跳过状态重置: {exc}")
+            logger.bind(session_id=session_id).warning(
+                f"读取 session_context.json 失败，跳过状态重置: {exc}"
+            )
             context_data = None
 
         if isinstance(context_data, dict):
@@ -718,7 +779,8 @@ async def edit_last_user_message(
     if not conversation:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail=f"会话 {session_id} 不存在",
+                message_key="conversation.not_found",
+                message_params={"session_id": session_id},
                 error_detail=f"Conversation '{session_id}' not found",
             )
         )
@@ -726,7 +788,7 @@ async def edit_last_user_message(
     if user_id and conversation.user_id and conversation.user_id != user_id:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail="无权编辑该会话",
+                message_key="conversation.edit_forbidden",
                 error_detail="forbidden",
             )
         )
@@ -735,12 +797,15 @@ async def edit_last_user_message(
     if not cleaned_content:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail="编辑后的消息不能为空",
+                message_key="conversation.edited_message_required",
                 error_detail="Edited message cannot be empty",
             )
         )
 
-    await interrupt_session(session_id, "编辑最后一条用户消息")
+    await interrupt_session(
+        session_id,
+        t("chat.edit_last_user_message", locale=get_request_locale()),
+    )
     await _get_stream_manager().stop_session(session_id)
 
     source_messages = await asyncio.to_thread(_load_session_raw_messages, session_id)
@@ -752,12 +817,19 @@ async def edit_last_user_message(
 
     from common.services.chat_service import _sanitize_title_text
 
-    title_source = _sanitize_title_text(
-        _extract_text_from_message_content(last_user_message.get("content"))
-    ) or conversation.title or "新会话"
+    title_source = (
+        _sanitize_title_text(
+            _extract_text_from_message_content(last_user_message.get("content"))
+        )
+        or conversation.title
+        or "新会话"
+    )
 
     await dao.update_conversation_messages(session_id, truncated_messages)
-    await dao.update_title(session_id, title_source[:50] + "..." if len(title_source) > 50 else title_source)
+    await dao.update_title(
+        session_id,
+        title_source[:50] + "..." if len(title_source) > 50 else title_source,
+    )
     await asyncio.to_thread(_write_session_files, session_id, truncated_messages)
 
     manager = get_global_session_manager()
@@ -788,7 +860,8 @@ async def get_rerun_conversation_payload(
     if not conversation:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail=f"会话 {session_id} 不存在",
+                message_key="conversation.not_found",
+                message_params={"session_id": session_id},
                 error_detail=f"Conversation '{session_id}' not found",
             )
         )
@@ -796,7 +869,7 @@ async def get_rerun_conversation_payload(
     if user_id and conversation.user_id and conversation.user_id != user_id:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail="无权重跑该会话",
+                message_key="conversation.rerun_forbidden",
                 error_detail="forbidden",
             )
         )
@@ -807,7 +880,7 @@ async def get_rerun_conversation_payload(
     if last_user_index < 0:
         raise SageHTTPException(
             **_conversation_error_kwargs(
-                detail="会话中不存在可重跑的用户消息",
+                message_key="conversation.no_rerunnable_user_message",
                 error_detail="No rerunnable user message found",
             )
         )
@@ -868,4 +941,6 @@ async def get_agent_usage_stats(
     )
 
     sessions_root = Path(get_sessions_root())
-    return await asyncio.to_thread(_load_tools_usage_counts_sync, conversations, sessions_root)
+    return await asyncio.to_thread(
+        _load_tools_usage_counts_sync, conversations, sessions_root
+    )

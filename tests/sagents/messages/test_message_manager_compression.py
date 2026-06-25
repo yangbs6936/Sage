@@ -4,7 +4,7 @@ Test MessageManager's extract_all_context_messages function
 Especially the compress_conversation_history tool call detection logic
 """
 
-import os
+import sys
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -20,8 +20,8 @@ class TestExtractAllContextMessages:
         role: str,
         content: str,
         msg_type: Optional[str] = None,
-        tool_calls: List[Dict] = None,
-        tool_call_id: str = None
+        tool_calls: List[Dict] = None,  # pyright: ignore[reportArgumentType]
+        tool_call_id: str = None,  # pyright: ignore[reportArgumentType]
     ) -> MessageChunk:
         """Create test message"""
         if msg_type is None:
@@ -41,7 +41,7 @@ class TestExtractAllContextMessages:
             type=msg_type,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
-            timestamp=datetime.now().timestamp()
+            timestamp=datetime.now().timestamp(),
         )
 
     def create_compress_tool_call(self, index: int = 1) -> Dict[str, Any]:
@@ -49,10 +49,7 @@ class TestExtractAllContextMessages:
         return {
             "id": f"call_compress_{index}",
             "type": "function",
-            "function": {
-                "name": "compress_conversation_history",
-                "arguments": "{}"
-            }
+            "function": {"name": "compress_conversation_history", "arguments": "{}"},
         }
 
     def test_no_compression_tool(self):
@@ -61,17 +58,58 @@ class TestExtractAllContextMessages:
 
         messages = [
             self.create_message(MessageRole.USER.value, "User message 1"),
-            self.create_message(MessageRole.ASSISTANT.value, "Assistant response 1", msg_type=MessageType.FINAL_ANSWER.value),
+            self.create_message(
+                MessageRole.ASSISTANT.value,
+                "Assistant response 1",
+                msg_type=MessageType.FINAL_ANSWER.value,
+            ),
             self.create_message(MessageRole.USER.value, "User message 2"),
-            self.create_message(MessageRole.ASSISTANT.value, "Assistant response 2", msg_type=MessageType.FINAL_ANSWER.value),
+            self.create_message(
+                MessageRole.ASSISTANT.value,
+                "Assistant response 2",
+                msg_type=MessageType.FINAL_ANSWER.value,
+            ),
         ]
         mm.messages = messages
 
-        result = mm.extract_all_context_messages(recent_turns=0, last_turn_user_only=False)
+        result = mm.extract_all_context_messages(
+            recent_turns=0, last_turn_user_only=False
+        )
 
         assert len(result) == 4
         assert result[0].role == MessageRole.USER.value
         print("OK: No compression tool - normal extraction")
+
+    def test_system_triggered_run_stays_in_default_context(self):
+        """System-triggered assistant context should reach LLM requests."""
+        mm = MessageManager(session_id="test_session_system_triggered")
+
+        messages = [
+            self.create_message(MessageRole.USER.value, "Set a package reminder"),
+            self.create_message(
+                MessageRole.ASSISTANT.value,
+                "Package reminder created",
+                msg_type=MessageType.FINAL_ANSWER.value,
+            ),
+            self.create_message(
+                MessageRole.ASSISTANT.value,
+                "<system_triggered_run>\nassistant_message_to_user:\nWant to visit the restaurant again?\n</system_triggered_run>",
+                msg_type=MessageType.SYSTEM_TRIGGERED_RUN.value,
+            ),
+            self.create_message(MessageRole.USER.value, "Yes, today too"),
+        ]
+        mm.messages = messages
+
+        result = mm.extract_all_context_messages(
+            recent_turns=0, last_turn_user_only=False
+        )
+        request_messages = MessageManager.convert_messages_to_dict_for_request(result)
+
+        assert any(
+            message["role"] == MessageRole.ASSISTANT.value
+            and "Want to visit the restaurant again?" in message["content"]
+            for message in request_messages
+        )
 
     def test_single_compression_tool(self):
         """Test: extract from corresponding User when single compression tool exists"""
@@ -79,35 +117,44 @@ class TestExtractAllContextMessages:
 
         messages = [
             self.create_message(MessageRole.USER.value, "User message 1"),
-            self.create_message(MessageRole.ASSISTANT.value, "Assistant response 1", msg_type=MessageType.FINAL_ANSWER.value),
+            self.create_message(
+                MessageRole.ASSISTANT.value,
+                "Assistant response 1",
+                msg_type=MessageType.FINAL_ANSWER.value,
+            ),
             self.create_message(MessageRole.USER.value, "User message 2"),
             # Compression tool call (use TOOL_CALL type)
             self.create_message(
                 MessageRole.ASSISTANT.value,
                 "",
                 msg_type=MessageType.TOOL_CALL.value,
-                tool_calls=[self.create_compress_tool_call(1)]
+                tool_calls=[self.create_compress_tool_call(1)],
             ),
             self.create_message(
                 MessageRole.TOOL.value,
                 '{"compressed": true}',
                 tool_call_id="call_compress_1",
-                msg_type=MessageType.TOOL_CALL_RESULT.value
+                msg_type=MessageType.TOOL_CALL_RESULT.value,
             ),
             self.create_message(MessageRole.USER.value, "User message 3"),
-            self.create_message(MessageRole.ASSISTANT.value, "Assistant response 3", msg_type=MessageType.FINAL_ANSWER.value),
+            self.create_message(
+                MessageRole.ASSISTANT.value,
+                "Assistant response 3",
+                msg_type=MessageType.FINAL_ANSWER.value,
+            ),
         ]
         mm.messages = messages
 
-        result = mm.extract_all_context_messages(recent_turns=0, last_turn_user_only=False)
+        result = mm.extract_all_context_messages(
+            recent_turns=0, last_turn_user_only=False
+        )
 
-        # Should start from "User message 2" (User corresponding to compression tool)
-        # User-2, Assistant(with tool), Tool, User-3, Assistant-3
-        assert len(result) == 5
+        # Without success metadata/source ids this is not a valid compression anchor.
+        assert len(result) == 7
         assert result[0].role == MessageRole.USER.value
-        assert result[0].content == "User message 2"
-        assert result[1].role == MessageRole.ASSISTANT.value
-        assert result[1].tool_calls is not None
+        assert result[0].content == "User message 1"
+        assert result[3].role == MessageRole.ASSISTANT.value
+        assert result[3].tool_calls is not None
         print("OK: Single compression tool - extract from corresponding User")
 
     def test_multiple_compression_tools_same_user(self):
@@ -121,54 +168,58 @@ class TestExtractAllContextMessages:
                 MessageRole.ASSISTANT.value,
                 "",
                 msg_type=MessageType.TOOL_CALL.value,
-                tool_calls=[self.create_compress_tool_call(1)]
+                tool_calls=[self.create_compress_tool_call(1)],
             ),
             self.create_message(
                 MessageRole.TOOL.value,
                 '{"compressed": true}',
                 tool_call_id="call_compress_1",
-                msg_type=MessageType.TOOL_CALL_RESULT.value
+                msg_type=MessageType.TOOL_CALL_RESULT.value,
             ),
             # Second compression tool call (under same User)
             self.create_message(
                 MessageRole.ASSISTANT.value,
                 "",
                 msg_type=MessageType.TOOL_CALL.value,
-                tool_calls=[self.create_compress_tool_call(2)]
+                tool_calls=[self.create_compress_tool_call(2)],
             ),
             self.create_message(
                 MessageRole.TOOL.value,
                 '{"compressed": true}',
                 tool_call_id="call_compress_2",
-                msg_type=MessageType.TOOL_CALL_RESULT.value
+                msg_type=MessageType.TOOL_CALL_RESULT.value,
             ),
             # Third compression tool call (under same User)
             self.create_message(
                 MessageRole.ASSISTANT.value,
                 "",
                 msg_type=MessageType.TOOL_CALL.value,
-                tool_calls=[self.create_compress_tool_call(3)]
+                tool_calls=[self.create_compress_tool_call(3)],
             ),
             self.create_message(
                 MessageRole.TOOL.value,
                 '{"compressed": true}',
                 tool_call_id="call_compress_3",
-                msg_type=MessageType.TOOL_CALL_RESULT.value
+                msg_type=MessageType.TOOL_CALL_RESULT.value,
             ),
             self.create_message(MessageRole.USER.value, "User message 2"),
-            self.create_message(MessageRole.ASSISTANT.value, "Assistant response 2", msg_type=MessageType.FINAL_ANSWER.value),
+            self.create_message(
+                MessageRole.ASSISTANT.value,
+                "Assistant response 2",
+                msg_type=MessageType.FINAL_ANSWER.value,
+            ),
         ]
         mm.messages = messages
 
-        result = mm.extract_all_context_messages(recent_turns=0, last_turn_user_only=False)
+        result = mm.extract_all_context_messages(
+            recent_turns=0, last_turn_user_only=False
+        )
 
-        # Should start from "User message 1", keep User and last compression tool and after
-        # User-1, Assistant-3(with tool), Tool-3, User-2, Assistant-2
-        assert len(result) == 5
+        # Without success metadata/source ids these are not valid compression anchors.
+        assert len(result) == 9
         assert result[0].role == MessageRole.USER.value
         assert result[0].content == "User message 1"
-        # Check it's the 3rd compression tool (last one)
-        assert result[1].tool_calls[0]["id"] == "call_compress_3"
+        assert result[1].tool_calls[0]["id"] == "call_compress_1"  # pyright: ignore[reportOptionalSubscript]
         print("OK: Multiple compression tools - keep User and last tool")
 
     def test_compression_tool_with_other_tools(self):
@@ -182,17 +233,19 @@ class TestExtractAllContextMessages:
                 MessageRole.ASSISTANT.value,
                 "",
                 msg_type=MessageType.TOOL_CALL.value,
-                tool_calls=[{
-                    "id": "call_other_1",
-                    "type": "function",
-                    "function": {"name": "other_tool", "arguments": "{}"}
-                }]
+                tool_calls=[
+                    {
+                        "id": "call_other_1",
+                        "type": "function",
+                        "function": {"name": "other_tool", "arguments": "{}"},
+                    }
+                ],
             ),
             self.create_message(
                 MessageRole.TOOL.value,
                 "Other tool result",
                 tool_call_id="call_other_1",
-                msg_type=MessageType.TOOL_CALL_RESULT.value
+                msg_type=MessageType.TOOL_CALL_RESULT.value,
             ),
             self.create_message(MessageRole.USER.value, "User message 2"),
             # Compression tool call
@@ -200,23 +253,25 @@ class TestExtractAllContextMessages:
                 MessageRole.ASSISTANT.value,
                 "",
                 msg_type=MessageType.TOOL_CALL.value,
-                tool_calls=[self.create_compress_tool_call(1)]
+                tool_calls=[self.create_compress_tool_call(1)],
             ),
             self.create_message(
                 MessageRole.TOOL.value,
                 '{"compressed": true}',
                 tool_call_id="call_compress_1",
-                msg_type=MessageType.TOOL_CALL_RESULT.value
+                msg_type=MessageType.TOOL_CALL_RESULT.value,
             ),
             self.create_message(MessageRole.USER.value, "User message 3"),
         ]
         mm.messages = messages
 
-        result = mm.extract_all_context_messages(recent_turns=0, last_turn_user_only=False)
+        result = mm.extract_all_context_messages(
+            recent_turns=0, last_turn_user_only=False
+        )
 
-        # Should start from "User message 2"
+        # Invalid compression metadata should not hide earlier tool history.
         assert result[0].role == MessageRole.USER.value
-        assert result[0].content == "User message 2"
+        assert result[0].content == "User message 1"
         print("OK: Compression tool mixed with other tools")
 
     def test_is_compress_history_tool_call(self):
@@ -225,7 +280,7 @@ class TestExtractAllContextMessages:
         compress_msg = self.create_message(
             MessageRole.ASSISTANT.value,
             "",
-            tool_calls=[self.create_compress_tool_call(1)]
+            tool_calls=[self.create_compress_tool_call(1)],
         )
         assert MessageManager._is_compress_history_tool_call(compress_msg) is True
 
@@ -237,11 +292,13 @@ class TestExtractAllContextMessages:
         other_tool_msg = self.create_message(
             MessageRole.ASSISTANT.value,
             "",
-            tool_calls=[{
-                "id": "call_other",
-                "type": "function",
-                "function": {"name": "other_tool", "arguments": "{}"}
-            }]
+            tool_calls=[
+                {
+                    "id": "call_other",
+                    "type": "function",
+                    "function": {"name": "other_tool", "arguments": "{}"},
+                }
+            ],
         )
         assert MessageManager._is_compress_history_tool_call(other_tool_msg) is False
 
@@ -261,20 +318,26 @@ class TestExtractAllContextMessages:
                 MessageRole.ASSISTANT.value,
                 "",
                 msg_type=MessageType.TOOL_CALL.value,
-                tool_calls=[self.create_compress_tool_call(1)]
+                tool_calls=[self.create_compress_tool_call(1)],
             ),
             self.create_message(
                 MessageRole.TOOL.value,
                 '{"compressed": true}',
                 tool_call_id="call_compress_1",
-                msg_type=MessageType.TOOL_CALL_RESULT.value
+                msg_type=MessageType.TOOL_CALL_RESULT.value,
             ),
             self.create_message(MessageRole.USER.value, "User message 2"),
-            self.create_message(MessageRole.ASSISTANT.value, "Assistant response 2", msg_type=MessageType.FINAL_ANSWER.value),
+            self.create_message(
+                MessageRole.ASSISTANT.value,
+                "Assistant response 2",
+                msg_type=MessageType.FINAL_ANSWER.value,
+            ),
         ]
         mm.messages = messages
 
-        result = mm.extract_all_context_messages(recent_turns=0, last_turn_user_only=True)
+        result = mm.extract_all_context_messages(
+            recent_turns=0, last_turn_user_only=True
+        )
 
         # Should start from User-1, but last round only keeps User
         # User-1, Assistant(with tool), Tool, User-2
@@ -288,7 +351,11 @@ class TestExtractAllContextMessages:
         # Test: no compression tool
         messages = [
             self.create_message(MessageRole.USER.value, "User 1"),
-            self.create_message(MessageRole.ASSISTANT.value, "Assistant 1", msg_type=MessageType.FINAL_ANSWER.value),
+            self.create_message(
+                MessageRole.ASSISTANT.value,
+                "Assistant 1",
+                msg_type=MessageType.FINAL_ANSWER.value,
+            ),
         ]
         result = MessageManager.extract_messages_for_inference(messages)
         assert len(result) == 2
@@ -296,22 +363,26 @@ class TestExtractAllContextMessages:
         # Test: with compression tool
         messages = [
             self.create_message(MessageRole.USER.value, "User 1"),
-            self.create_message(MessageRole.ASSISTANT.value, "Assistant 1", msg_type=MessageType.FINAL_ANSWER.value),
+            self.create_message(
+                MessageRole.ASSISTANT.value,
+                "Assistant 1",
+                msg_type=MessageType.FINAL_ANSWER.value,
+            ),
             self.create_message(MessageRole.USER.value, "User 2"),
             self.create_message(
                 MessageRole.ASSISTANT.value,
                 "",
                 msg_type=MessageType.TOOL_CALL.value,
-                tool_calls=[self.create_compress_tool_call(1)]
+                tool_calls=[self.create_compress_tool_call(1)],
             ),
             self.create_message(MessageRole.USER.value, "User 3"),
         ]
         result = MessageManager.extract_messages_for_inference(messages)
-        # Should keep User-2 + compression tool + User-3
-        assert len(result) == 3
-        assert result[0].content == "User 2"
-        assert result[1].tool_calls is not None
-        assert result[2].content == "User 3"
+        # Tool call without a successful tool result metadata is not an anchor.
+        assert len(result) == 5
+        assert result[0].content == "User 1"
+        assert result[3].tool_calls is not None
+        assert result[4].content == "User 3"
 
         print("OK: extract_messages_for_inference static method")
 
@@ -320,9 +391,9 @@ def run_tests():
     """Run all tests"""
     test_class = TestExtractAllContextMessages()
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Testing extract_all_context_messages function")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
     try:
         test_class.test_no_compression_tool()
@@ -333,18 +404,20 @@ def run_tests():
         test_class.test_last_turn_user_only_with_compression()
         test_class.test_extract_messages_for_inference_static()
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("All tests passed!")
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
         return True
     except AssertionError as e:
         print(f"\nTest failed: {e}")
         import traceback
+
         traceback.print_exc()
         return False
     except Exception as e:
         print(f"\nTest execution error: {e}")
         import traceback
+
         traceback.print_exc()
         return False
 

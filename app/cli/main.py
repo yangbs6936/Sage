@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import sys
 from typing import Iterable, Optional
 
 from app.cli.commands.management import (
@@ -11,6 +12,7 @@ from app.cli.commands.management import (
     sessions_command as _sessions_command,
     skills_command as _skills_command,
 )
+from app.cli.commands.tui import tui_command as _tui_command
 from app.cli.commands.session import (
     build_request as _build_request_impl,
     chat_command as _chat_command_impl,
@@ -26,25 +28,22 @@ from app.cli.formatting import (
 )
 from app.cli.parser import build_argument_parser
 from app.cli.runtime.rendering import (
-    _collect_event_file_paths,
-    _collect_event_tool_names,
+    _collect_event_file_paths as _collect_event_file_paths,
+    _collect_event_tool_names as _collect_event_tool_names,
     _emit_chat_exit_summary,
-    _emit_stream_idle_notice,
-    _emit_stream_idle_notice_for_state,
-    _empty_render_state,
-    _print_plain_event,
+    _emit_stream_idle_notice as _emit_stream_idle_notice,
+    _emit_stream_idle_notice_for_state as _emit_stream_idle_notice_for_state,
+    _empty_render_state as _empty_render_state,
+    _print_plain_event as _print_plain_event,
     _read_chat_prompt,
-    _render_assistant_content_delta,
+    _render_assistant_content_delta as _render_assistant_content_delta,
 )
 from app.cli.runtime.stats import (
-    _empty_stats,
-    _finalize_stats,
-    _print_stats,
-    _record_stats_event,
+    _empty_stats as _empty_stats,
+    _finalize_stats as _finalize_stats,
+    _record_stats_event as _record_stats_event,
 )
 from app.cli.runtime.stream import (
-    STREAM_IDLE_NOTICE_SECONDS,
-    STREAM_IDLE_REPEAT_SECONDS,
     _stream_request,
 )
 
@@ -121,14 +120,22 @@ async def _main_async(args: argparse.Namespace) -> int:
             return _config_init_command(args)
         if args.command == "provider":
             return await _provider_command(args)
+        if args.command == "tui":
+            return _tui_command(args)
         raise ValueError(f"Unsupported command: {args.command}")
     except Exception as exc:
-        return _emit_cli_error(args, _build_cli_error_payload(exc, verbose=getattr(args, "verbose", False)))
+        return _emit_cli_error(
+            args, _build_cli_error_payload(exc, verbose=getattr(args, "verbose", False))
+        )
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = build_argument_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
+    if raw_args and raw_args[0] == "tui":
+        args = argparse.Namespace(command="tui", terminal_args=raw_args[1:])
+    else:
+        args = parser.parse_args(raw_args)
     return asyncio.run(_main_async(args))
 
 

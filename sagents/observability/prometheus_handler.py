@@ -1,4 +1,5 @@
 import contextvars
+import hashlib
 import threading
 import time
 from dataclasses import dataclass, field
@@ -7,24 +8,57 @@ from typing import Any, Dict, List, Union
 from .base import BaseTraceHandler
 
 
-_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
-_OP_STACK: contextvars.ContextVar[tuple[tuple[str, str, float], ...]] = contextvars.ContextVar(
-    "sagents_prometheus_operation_stack",
-    default=(),
+_DURATION_BUCKETS = (
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+)
+_OP_STACK: contextvars.ContextVar[tuple[tuple[str, str, str, float], ...]] = (
+    contextvars.ContextVar(
+        "sagents_prometheus_operation_stack",
+        default=(),
+    )
 )
 
 
 @dataclass
 class _PrometheusTraceState:
     lock: threading.Lock = field(default_factory=threading.Lock)
-    total: dict[tuple[str, str, str], int] = field(default_factory=dict)
-    duration_sum: dict[tuple[str, str], float] = field(default_factory=dict)
-    duration_count: dict[tuple[str, str], int] = field(default_factory=dict)
-    duration_buckets: dict[tuple[str, str, float], int] = field(default_factory=dict)
-    active: dict[tuple[str, str], int] = field(default_factory=dict)
+    agent_starts_total: dict[str, int] = field(default_factory=dict)
+    agent_total: dict[tuple[str, str], int] = field(default_factory=dict)
+    agent_active: dict[tuple[str, str], int] = field(default_factory=dict)
+    agent_duration_sum: dict[tuple[str, str], float] = field(default_factory=dict)
+    agent_duration_count: dict[tuple[str, str], int] = field(default_factory=dict)
+    agent_duration_buckets: dict[tuple[str, str, float], int] = field(
+        default_factory=dict
+    )
+    first_token_duration_sum: dict[tuple[str, str], float] = field(default_factory=dict)
+    first_token_duration_count: dict[tuple[str, str], int] = field(default_factory=dict)
+    first_token_duration_buckets: dict[tuple[str, str, float], int] = field(
+        default_factory=dict
+    )
+    tool_total: dict[tuple[str, str], int] = field(default_factory=dict)
+    tool_duration_sum: dict[str, float] = field(default_factory=dict)
+    tool_duration_count: dict[str, int] = field(default_factory=dict)
+    tool_duration_buckets: dict[tuple[str, float], int] = field(default_factory=dict)
+    tool_failures: dict[tuple[str, str, str, str], int] = field(default_factory=dict)
 
 
 _STATE = _PrometheusTraceState()
+
+
+def build_session_trace_id(session_id: str) -> str:
+    return hashlib.md5(str(session_id or "unknown").encode("utf-8")).hexdigest()
 
 
 def _escape_label_value(value: str) -> str:
@@ -32,129 +66,388 @@ def _escape_label_value(value: str) -> str:
 
 
 def _labeled_metric_line(name: str, labels: dict[str, str], value: int | float) -> str:
-    rendered_labels = ",".join(f'{key}="{_escape_label_value(val)}"' for key, val in labels.items())
+    rendered_labels = ",".join(
+        f'{key}="{_escape_label_value(val)}"' for key, val in labels.items()
+    )
     return f"{name}{{{rendered_labels}}} {float(value):.6f}"
 
 
-def _start_operation(category: str, name: str) -> None:
-    started_at = time.perf_counter()
-    key = (category, name)
-    with _STATE.lock:
-        _STATE.active[key] = _STATE.active.get(key, 0) + 1
-    _OP_STACK.set(_OP_STACK.get() + ((category, name, started_at),))
+def _normalize_label_value(value: Any, fallback: str = "unknown") -> str:
+    text = str(value or "").strip()
+    return text or fallback
 
 
-def _finish_operation(category: str, name: str, status: str) -> None:
+def _push_operation(kind: str, name: str, session_id: str) -> None:
+    _OP_STACK.set(
+        _OP_STACK.get()
+        + ((kind, name, _normalize_label_value(session_id), time.perf_counter()),)
+    )
+
+
+def _pop_operation(kind: str) -> tuple[str, str, float] | None:
     stack = _OP_STACK.get()
-    started_at = None
-    remaining: list[tuple[str, str, float]] = []
+    remaining: list[tuple[str, str, str, float]] = []
+    matched: tuple[str, str, float] | None = None
     for item in reversed(stack):
-        item_category, item_name, item_started_at = item
-        if started_at is None and item_category == category and item_name == name:
-            started_at = item_started_at
+        item_kind, name, session_id, started_at = item
+        if matched is None and item_kind == kind:
+            matched = (name, session_id, started_at)
             continue
         remaining.append(item)
-    if started_at is None:
-        return
+    if matched is None:
+        return None
     remaining.reverse()
     _OP_STACK.set(tuple(remaining))
+    return matched
 
-    duration = max(time.perf_counter() - started_at, 0.0)
-    key = (category, name)
-    status_key = (category, name, status or "unknown")
+
+def _record_agent(agent_id: str, status: str) -> None:
+    normalized_agent_id = _normalize_label_value(agent_id)
+    normalized_status = _normalize_label_value(status)
+    key = (normalized_agent_id, normalized_status)
     with _STATE.lock:
-        _STATE.total[status_key] = _STATE.total.get(status_key, 0) + 1
-        _STATE.duration_sum[key] = _STATE.duration_sum.get(key, 0.0) + duration
-        _STATE.duration_count[key] = _STATE.duration_count.get(key, 0) + 1
+        _STATE.agent_total[key] = _STATE.agent_total.get(key, 0) + 1
+
+
+def _record_agent_start(agent_id: str) -> None:
+    normalized_agent_id = _normalize_label_value(agent_id)
+    with _STATE.lock:
+        _STATE.agent_starts_total[normalized_agent_id] = (
+            _STATE.agent_starts_total.get(normalized_agent_id, 0) + 1
+        )
+
+
+def _increment_agent_active(agent_id: str, session_id: str) -> None:
+    key = (_normalize_label_value(agent_id), _normalize_label_value(session_id))
+    with _STATE.lock:
+        _STATE.agent_active[key] = _STATE.agent_active.get(key, 0) + 1
+
+
+def _decrement_agent_active(agent_id: str, session_id: str) -> None:
+    key = (_normalize_label_value(agent_id), _normalize_label_value(session_id))
+    with _STATE.lock:
+        active = _STATE.agent_active.get(key, 0)
+        if active <= 1:
+            _STATE.agent_active.pop(key, None)
+        else:
+            _STATE.agent_active[key] = active - 1
+
+
+def _record_agent_duration(agent_id: str, status: str, duration_seconds: float) -> None:
+    normalized_agent_id = _normalize_label_value(agent_id)
+    normalized_status = _normalize_label_value(status)
+    key = (normalized_agent_id, normalized_status)
+    duration = max(float(duration_seconds or 0.0), 0.0)
+    with _STATE.lock:
+        _STATE.agent_duration_sum[key] = (
+            _STATE.agent_duration_sum.get(key, 0.0) + duration
+        )
+        _STATE.agent_duration_count[key] = _STATE.agent_duration_count.get(key, 0) + 1
         for bucket in _DURATION_BUCKETS:
             if duration <= bucket:
-                bucket_key = (category, name, bucket)
-                _STATE.duration_buckets[bucket_key] = _STATE.duration_buckets.get(bucket_key, 0) + 1
-        _STATE.active[key] = max(_STATE.active.get(key, 0) - 1, 0)
+                bucket_key = (normalized_agent_id, normalized_status, bucket)
+                _STATE.agent_duration_buckets[bucket_key] = (
+                    _STATE.agent_duration_buckets.get(bucket_key, 0) + 1
+                )
+
+
+def record_agent_first_token(
+    agent_id: str, session_id: str, duration_seconds: float
+) -> None:
+    normalized_agent_id = _normalize_label_value(agent_id)
+    normalized_session_id = _normalize_label_value(session_id)
+    key = (normalized_agent_id, normalized_session_id)
+    duration = max(float(duration_seconds or 0.0), 0.0)
+    with _STATE.lock:
+        _STATE.first_token_duration_sum[key] = (
+            _STATE.first_token_duration_sum.get(key, 0.0) + duration
+        )
+        _STATE.first_token_duration_count[key] = (
+            _STATE.first_token_duration_count.get(key, 0) + 1
+        )
+        for bucket in _DURATION_BUCKETS:
+            if duration <= bucket:
+                bucket_key = (normalized_agent_id, normalized_session_id, bucket)
+                _STATE.first_token_duration_buckets[bucket_key] = (
+                    _STATE.first_token_duration_buckets.get(bucket_key, 0) + 1
+                )
+
+
+def _record_tool(tool_name: str, status: str, duration: float) -> None:
+    normalized_tool_name = _normalize_label_value(tool_name)
+    normalized_status = _normalize_label_value(status)
+    with _STATE.lock:
+        total_key = (normalized_tool_name, normalized_status)
+        _STATE.tool_total[total_key] = _STATE.tool_total.get(total_key, 0) + 1
+        _STATE.tool_duration_sum[normalized_tool_name] = (
+            _STATE.tool_duration_sum.get(normalized_tool_name, 0.0) + duration
+        )
+        _STATE.tool_duration_count[normalized_tool_name] = (
+            _STATE.tool_duration_count.get(normalized_tool_name, 0) + 1
+        )
+        for bucket in _DURATION_BUCKETS:
+            if duration <= bucket:
+                bucket_key = (normalized_tool_name, bucket)
+                _STATE.tool_duration_buckets[bucket_key] = (
+                    _STATE.tool_duration_buckets.get(bucket_key, 0) + 1
+                )
+
+
+def _record_tool_failure(tool_name: str, session_id: str, error: Exception) -> None:
+    normalized_session_id = _normalize_label_value(session_id)
+    key = (
+        _normalize_label_value(tool_name),
+        normalized_session_id,
+        build_session_trace_id(normalized_session_id),
+        error.__class__.__name__ or "Error",
+    )
+    with _STATE.lock:
+        _STATE.tool_failures[key] = _STATE.tool_failures.get(key, 0) + 1
+
+
+def _agent_status(output: Any) -> str:
+    if not isinstance(output, dict):
+        return "success"
+    raw_status = str(output.get("status") or "finished").lower()
+    if raw_status == "finished":
+        return "success"
+    return raw_status or "unknown"
 
 
 def reset_prometheus_trace_metrics() -> None:
     with _STATE.lock:
-        _STATE.total.clear()
-        _STATE.duration_sum.clear()
-        _STATE.duration_count.clear()
-        _STATE.duration_buckets.clear()
-        _STATE.active.clear()
+        _STATE.agent_starts_total.clear()
+        _STATE.agent_total.clear()
+        _STATE.agent_active.clear()
+        _STATE.agent_duration_sum.clear()
+        _STATE.agent_duration_count.clear()
+        _STATE.agent_duration_buckets.clear()
+        _STATE.first_token_duration_sum.clear()
+        _STATE.first_token_duration_count.clear()
+        _STATE.first_token_duration_buckets.clear()
+        _STATE.tool_total.clear()
+        _STATE.tool_duration_sum.clear()
+        _STATE.tool_duration_count.clear()
+        _STATE.tool_duration_buckets.clear()
+        _STATE.tool_failures.clear()
     _OP_STACK.set(())
 
 
 def render_prometheus_trace_metrics() -> str:
-    lines = [
-        "# HELP sagents_observability_operations_total Total sagents operations by category, name, and status.",
-        "# TYPE sagents_observability_operations_total counter",
-    ]
     with _STATE.lock:
-        total = dict(_STATE.total)
-        duration_sum = dict(_STATE.duration_sum)
-        duration_count = dict(_STATE.duration_count)
-        duration_buckets = dict(_STATE.duration_buckets)
-        active = dict(_STATE.active)
+        agent_starts_total = dict(_STATE.agent_starts_total)
+        agent_total = dict(_STATE.agent_total)
+        agent_active = dict(_STATE.agent_active)
+        agent_duration_sum = dict(_STATE.agent_duration_sum)
+        agent_duration_count = dict(_STATE.agent_duration_count)
+        agent_duration_buckets = dict(_STATE.agent_duration_buckets)
+        first_token_duration_sum = dict(_STATE.first_token_duration_sum)
+        first_token_duration_count = dict(_STATE.first_token_duration_count)
+        first_token_duration_buckets = dict(_STATE.first_token_duration_buckets)
+        tool_total = dict(_STATE.tool_total)
+        tool_duration_sum = dict(_STATE.tool_duration_sum)
+        tool_duration_count = dict(_STATE.tool_duration_count)
+        tool_duration_buckets = dict(_STATE.tool_duration_buckets)
+        tool_failures = dict(_STATE.tool_failures)
 
-    for category, name, status in sorted(total):
+    lines = [
+        "# HELP sagents_agent_starts_total Total SAgents agent run starts by agent_id.",
+        "# TYPE sagents_agent_starts_total counter",
+    ]
+    for agent_id in sorted(agent_starts_total):
         lines.append(
             _labeled_metric_line(
-                "sagents_observability_operations_total",
-                {"category": category, "name": name, "status": status},
-                total[(category, name, status)],
+                "sagents_agent_starts_total",
+                {"agent_id": agent_id},
+                agent_starts_total[agent_id],
             )
         )
 
     lines.extend(
         [
-            "# HELP sagents_observability_operation_duration_seconds Sagents operation duration in seconds.",
-            "# TYPE sagents_observability_operation_duration_seconds histogram",
+            "# HELP sagents_agent_runs_total Total SAgents agent runs by agent_id and status.",
+            "# TYPE sagents_agent_runs_total counter",
         ]
     )
-    for category, name in sorted(set(duration_count) | set(duration_sum)):
+    for agent_id, status in sorted(agent_total):
+        lines.append(
+            _labeled_metric_line(
+                "sagents_agent_runs_total",
+                {"agent_id": agent_id, "status": status},
+                agent_total[(agent_id, status)],
+            )
+        )
+
+    lines.extend(
+        [
+            "# HELP sagents_agent_run_duration_seconds SAgents agent run duration in seconds.",
+            "# TYPE sagents_agent_run_duration_seconds histogram",
+        ]
+    )
+    for agent_id, status in sorted(set(agent_duration_count) | set(agent_duration_sum)):
         cumulative = 0
         for bucket in _DURATION_BUCKETS:
-            cumulative = duration_buckets.get((category, name, bucket), cumulative)
+            cumulative = agent_duration_buckets.get(
+                (agent_id, status, bucket), cumulative
+            )
             lines.append(
                 _labeled_metric_line(
-                    "sagents_observability_operation_duration_seconds_bucket",
-                    {"category": category, "name": name, "le": str(bucket)},
+                    "sagents_agent_run_duration_seconds_bucket",
+                    {"agent_id": agent_id, "status": status, "le": str(bucket)},
                     cumulative,
                 )
             )
         lines.append(
             _labeled_metric_line(
-                "sagents_observability_operation_duration_seconds_bucket",
-                {"category": category, "name": name, "le": "+Inf"},
-                duration_count.get((category, name), 0),
+                "sagents_agent_run_duration_seconds_bucket",
+                {"agent_id": agent_id, "status": status, "le": "+Inf"},
+                agent_duration_count.get((agent_id, status), 0),
             )
         )
         lines.append(
             _labeled_metric_line(
-                "sagents_observability_operation_duration_seconds_sum",
-                {"category": category, "name": name},
-                duration_sum.get((category, name), 0.0),
+                "sagents_agent_run_duration_seconds_sum",
+                {"agent_id": agent_id, "status": status},
+                agent_duration_sum.get((agent_id, status), 0.0),
             )
         )
         lines.append(
             _labeled_metric_line(
-                "sagents_observability_operation_duration_seconds_count",
-                {"category": category, "name": name},
-                duration_count.get((category, name), 0),
+                "sagents_agent_run_duration_seconds_count",
+                {"agent_id": agent_id, "status": status},
+                agent_duration_count.get((agent_id, status), 0),
             )
         )
 
     lines.extend(
         [
-            "# HELP sagents_observability_operations_active Sagents operations currently in progress.",
-            "# TYPE sagents_observability_operations_active gauge",
+            "# HELP sagents_agent_runs_active SAgents agent runs currently in progress.",
+            "# TYPE sagents_agent_runs_active gauge",
         ]
     )
-    for category, name in sorted(active):
+    for agent_id, session_id in sorted(agent_active):
         lines.append(
             _labeled_metric_line(
-                "sagents_observability_operations_active",
-                {"category": category, "name": name},
-                active[(category, name)],
+                "sagents_agent_runs_active",
+                {"agent_id": agent_id, "session_id": session_id},
+                agent_active[(agent_id, session_id)],
+            )
+        )
+
+    lines.extend(
+        [
+            "# HELP sagents_first_token_seconds SAgents time from run_stream start to first visible assistant/tool content.",
+            "# TYPE sagents_first_token_seconds histogram",
+        ]
+    )
+    for agent_id, session_id in sorted(
+        set(first_token_duration_count) | set(first_token_duration_sum)
+    ):
+        cumulative = 0
+        for bucket in _DURATION_BUCKETS:
+            cumulative = first_token_duration_buckets.get(
+                (agent_id, session_id, bucket), cumulative
+            )
+            lines.append(
+                _labeled_metric_line(
+                    "sagents_first_token_seconds_bucket",
+                    {"agent_id": agent_id, "session_id": session_id, "le": str(bucket)},
+                    cumulative,
+                )
+            )
+        lines.append(
+            _labeled_metric_line(
+                "sagents_first_token_seconds_bucket",
+                {"agent_id": agent_id, "session_id": session_id, "le": "+Inf"},
+                first_token_duration_count.get((agent_id, session_id), 0),
+            )
+        )
+        lines.append(
+            _labeled_metric_line(
+                "sagents_first_token_seconds_sum",
+                {"agent_id": agent_id, "session_id": session_id},
+                first_token_duration_sum.get((agent_id, session_id), 0.0),
+            )
+        )
+        lines.append(
+            _labeled_metric_line(
+                "sagents_first_token_seconds_count",
+                {"agent_id": agent_id, "session_id": session_id},
+                first_token_duration_count.get((agent_id, session_id), 0),
+            )
+        )
+
+    lines.extend(
+        [
+            "# HELP sagents_tool_calls_total Total SAgents tool calls by tool_name and status.",
+            "# TYPE sagents_tool_calls_total counter",
+        ]
+    )
+    for tool_name, status in sorted(tool_total):
+        lines.append(
+            _labeled_metric_line(
+                "sagents_tool_calls_total",
+                {"tool_name": tool_name, "status": status},
+                tool_total[(tool_name, status)],
+            )
+        )
+
+    lines.extend(
+        [
+            "# HELP sagents_tool_call_duration_seconds SAgents tool call duration in seconds.",
+            "# TYPE sagents_tool_call_duration_seconds histogram",
+        ]
+    )
+    for tool_name in sorted(set(tool_duration_count) | set(tool_duration_sum)):
+        cumulative = 0
+        for bucket in _DURATION_BUCKETS:
+            cumulative = tool_duration_buckets.get((tool_name, bucket), cumulative)
+            lines.append(
+                _labeled_metric_line(
+                    "sagents_tool_call_duration_seconds_bucket",
+                    {"tool_name": tool_name, "le": str(bucket)},
+                    cumulative,
+                )
+            )
+        lines.append(
+            _labeled_metric_line(
+                "sagents_tool_call_duration_seconds_bucket",
+                {"tool_name": tool_name, "le": "+Inf"},
+                tool_duration_count.get(tool_name, 0),
+            )
+        )
+        lines.append(
+            _labeled_metric_line(
+                "sagents_tool_call_duration_seconds_sum",
+                {"tool_name": tool_name},
+                tool_duration_sum.get(tool_name, 0.0),
+            )
+        )
+        lines.append(
+            _labeled_metric_line(
+                "sagents_tool_call_duration_seconds_count",
+                {"tool_name": tool_name},
+                tool_duration_count.get(tool_name, 0),
+            )
+        )
+
+    lines.extend(
+        [
+            "# HELP sagents_tool_call_failures_total SAgents tool call failures with session_id for drilldown.",
+            "# TYPE sagents_tool_call_failures_total counter",
+        ]
+    )
+    for tool_name, session_id, trace_id, error_type in sorted(tool_failures):
+        lines.append(
+            _labeled_metric_line(
+                "sagents_tool_call_failures_total",
+                {
+                    "tool_name": tool_name,
+                    "session_id": session_id,
+                    "trace_id": trace_id,
+                    "error_type": error_type,
+                },
+                tool_failures[(tool_name, session_id, trace_id, error_type)],
             )
         )
     return "\n".join(lines) + "\n"
@@ -162,45 +455,57 @@ def render_prometheus_trace_metrics() -> str:
 
 class PrometheusTraceHandler(BaseTraceHandler):
     def on_chain_start(self, session_id: str, input_data: Any, **kwargs: Any) -> Any:
-        _start_operation("chain", "session")
+        return None
 
     def on_chain_end(self, output_data: Any, **kwargs: Any) -> Any:
-        _finish_operation("chain", "session", "success")
+        return None
 
     def on_chain_error(self, error: Exception, **kwargs: Any) -> Any:
-        _finish_operation("chain", "session", "error")
+        return None
 
     def on_agent_start(self, session_id: str, agent_name: str, **kwargs: Any) -> Any:
-        _start_operation("agent", agent_name or "unknown")
+        agent_id = _normalize_label_value(kwargs.get("agent_id") or agent_name)
+        normalized_session_id = _normalize_label_value(session_id)
+        _record_agent_start(agent_id)
+        _push_operation("agent", agent_id, normalized_session_id)
+        _increment_agent_active(agent_id, normalized_session_id)
 
     def on_agent_end(self, output: Any, **kwargs: Any) -> Any:
-        status = "success"
-        if isinstance(output, dict):
-            raw_status = str(output.get("status") or "finished").lower()
-            status = "success" if raw_status == "finished" else raw_status
-        _finish_operation("agent", _current_name_for_category("agent"), status)
+        current = _pop_operation("agent")
+        if not current:
+            return
+        agent_id, session_id, started_at = current
+        status = _agent_status(output)
+        _record_agent(agent_id, status)
+        _record_agent_duration(agent_id, status, time.perf_counter() - started_at)
+        _decrement_agent_active(agent_id, session_id)
 
     def on_agent_error(self, error: Exception, **kwargs: Any) -> Any:
-        _finish_operation("agent", _current_name_for_category("agent"), "error")
+        current = _pop_operation("agent")
+        agent_id = (
+            current[0] if current else _normalize_label_value(kwargs.get("agent_id"))
+        )
+        _record_agent(agent_id, "error")
+        if current:
+            _, session_id, started_at = current
+            _record_agent_duration(agent_id, "error", time.perf_counter() - started_at)
+            _decrement_agent_active(agent_id, session_id)
 
     def on_llm_start(
         self,
         session_id: str,
         model_name: str,
         messages: List[Any],
-        step_name: str = None,
+        step_name: str = None,  # pyright: ignore[reportArgumentType]
         **kwargs: Any,
     ) -> Any:
-        name = str(model_name or "unknown")
-        if step_name:
-            name = f"{name}/{step_name}"
-        _start_operation("llm", name)
+        return None
 
     def on_llm_end(self, response: Any, **kwargs: Any) -> Any:
-        _finish_operation("llm", _current_name_for_category("llm"), "success")
+        return None
 
     def on_llm_error(self, error: Exception, **kwargs: Any) -> Any:
-        _finish_operation("llm", _current_name_for_category("llm"), "error")
+        return None
 
     def on_tool_start(
         self,
@@ -209,36 +514,25 @@ class PrometheusTraceHandler(BaseTraceHandler):
         tool_input: Union[str, Dict],
         **kwargs: Any,
     ) -> Any:
-        tool_type = str(kwargs.get("tool_type") or "tool")
-        server_name = str(kwargs.get("server_name") or "")
-        category = "mcp" if tool_type == "mcp" else "tool"
-        name = f"{server_name}/{tool_name}" if category == "mcp" and server_name else str(tool_name or "unknown")
-        _start_operation(category, name)
+        _push_operation("tool", _normalize_label_value(tool_name), session_id)
 
     def on_tool_end(self, tool_output: Any, **kwargs: Any) -> Any:
-        category, name = _current_tool_category_and_name()
-        _finish_operation(category, name, "success")
+        current = _pop_operation("tool")
+        if not current:
+            return
+        tool_name, _, started_at = current
+        _record_tool(tool_name, "success", max(time.perf_counter() - started_at, 0.0))
 
     def on_tool_error(self, error: Exception, **kwargs: Any) -> Any:
-        category, name = _current_tool_category_and_name()
-        _finish_operation(category, name, "error")
+        current = _pop_operation("tool")
+        if not current:
+            return
+        tool_name, session_id, started_at = current
+        _record_tool(tool_name, "error", max(time.perf_counter() - started_at, 0.0))
+        _record_tool_failure(tool_name, session_id, error)
 
     def on_message_start(self, session_id: str, message_id: str, **kwargs: Any) -> Any:
         return None
 
     def on_message_end(self, session_id: str, message_id: str, **kwargs: Any) -> Any:
         return None
-
-
-def _current_name_for_category(category: str) -> str:
-    for item_category, item_name, _ in reversed(_OP_STACK.get()):
-        if item_category == category:
-            return item_name
-    return "unknown"
-
-
-def _current_tool_category_and_name() -> tuple[str, str]:
-    for category, name, _ in reversed(_OP_STACK.get()):
-        if category in {"tool", "mcp"}:
-            return category, name
-    return "tool", "unknown"

@@ -2,21 +2,36 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::app::{ActiveSurfaceKind, App, MessageKind, SubmitAction};
+use crate::backend::tests::lock_env;
 use crate::slash_command;
 
-use super::super::{handle_key, INLINE_VIEWPORT_IDLE_HEIGHT, INLINE_VIEWPORT_MAX_HEIGHT};
+use super::super::{event_poll_interval, handle_key, INLINE_VIEWPORT_IDLE_HEIGHT};
 use crate::terminal_layout::desired_viewport_height;
 
 #[test]
 fn terminal_loop_accepts_repeat_key_events_for_submission() {
     assert!(super::super::should_handle_key_event(KeyEventKind::Press));
     assert!(super::super::should_handle_key_event(KeyEventKind::Repeat));
-    assert!(!super::super::should_handle_key_event(KeyEventKind::Release));
+    assert!(!super::super::should_handle_key_event(
+        KeyEventKind::Release
+    ));
+}
+
+#[test]
+fn event_polling_is_slow_when_idle_and_fast_when_busy() {
+    let mut app = App::new();
+    let idle = event_poll_interval(&app, false);
+
+    app.busy = true;
+    let busy = event_poll_interval(&app, false);
+    let backend_active = event_poll_interval(&App::new(), true);
+
+    assert!(idle > busy);
+    assert_eq!(busy, backend_active);
 }
 
 #[test]
@@ -63,13 +78,22 @@ fn welcome_banner_expands_idle_viewport_height() {
     let app = App::new();
 
     assert!(
-        desired_viewport_height(
-            &app,
-            120,
-            INLINE_VIEWPORT_IDLE_HEIGHT,
-            INLINE_VIEWPORT_MAX_HEIGHT
-        ) > INLINE_VIEWPORT_IDLE_HEIGHT
+        desired_viewport_height(&app, 120, INLINE_VIEWPORT_IDLE_HEIGHT, 18)
+            > INLINE_VIEWPORT_IDLE_HEIGHT
     );
+}
+
+#[test]
+fn viewport_collapses_to_composer_after_transcript_is_in_scrollback() {
+    let mut app = App::new();
+    app.push_message(MessageKind::User, "hello");
+    app.materialize_pending_ui(120);
+    let _ = app.take_clear_request();
+    let _ = app.take_pending_history_lines();
+
+    let height = desired_viewport_height(&app, 120, INLINE_VIEWPORT_IDLE_HEIGHT, 18);
+
+    assert_eq!(height, INLINE_VIEWPORT_IDLE_HEIGHT);
 }
 
 #[test]
@@ -166,7 +190,7 @@ fn help_popup_submit_escape_and_welcome_flow_stays_consistent() {
     app.input = "hello".to_string();
     app.input_cursor = app.input.len();
     let action = app.submit_input();
-    assert!(matches!(action, SubmitAction::RunTask(_)));
+    assert!(matches!(action, SubmitAction::Handled));
     app.materialize_pending_ui(120);
     let rendered = app
         .pending_history_lines
@@ -194,6 +218,29 @@ fn ctrl_t_opens_transcript_overlay_when_idle() {
     .expect("ctrl-t should not fail");
 
     assert!(handled);
+    assert_eq!(
+        app.active_surface_kind(),
+        Some(ActiveSurfaceKind::Transcript)
+    );
+}
+
+#[test]
+fn ctrl_t_opens_transcript_overlay_while_busy() {
+    let mut app = App::new();
+    app.begin_task_submission("keep running".to_string(), true);
+    app.append_assistant_chunk("partial");
+    let _ = app.take_pending_history_lines();
+    let mut backend = None;
+
+    let handled = handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        &mut backend,
+    )
+    .expect("ctrl-t should open transcript even while busy");
+
+    assert!(handled);
+    assert!(app.busy);
     assert_eq!(
         app.active_surface_kind(),
         Some(ActiveSurfaceKind::Transcript)
@@ -404,6 +451,65 @@ fn busy_state_allows_typing_slash_interrupt_command() {
 }
 
 #[test]
+fn busy_state_allows_drafting_next_message_without_submitting() {
+    let mut app = App::new();
+    app.begin_task_submission("keep running".to_string(), true);
+    let mut backend = None;
+
+    for ch in "next task".chars() {
+        let handled = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            &mut backend,
+        )
+        .expect("typing draft while busy should not fail");
+        assert!(handled);
+    }
+
+    let handled = handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &mut backend,
+    )
+    .expect("enter while busy with draft should not fail");
+
+    assert!(handled);
+    assert!(app.busy);
+    assert_eq!(app.input, "next task");
+    assert_eq!(app.current_task.as_deref(), Some("keep running"));
+    assert!(app.status.contains("draft saved"));
+}
+
+#[test]
+fn busy_state_allows_editing_multiline_draft() {
+    let mut app = App::new();
+    app.begin_task_submission("keep running".to_string(), true);
+    app.input = "next".to_string();
+    app.input_cursor = app.input.len();
+    let mut backend = None;
+
+    let handled = handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        &mut backend,
+    )
+    .expect("shift-enter draft newline while busy should not fail");
+    assert!(handled);
+
+    let handled = handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        &mut backend,
+    )
+    .expect("typing draft continuation while busy should not fail");
+    assert!(handled);
+
+    assert_eq!(app.input, "next\nx");
+    app.backspace();
+    assert_eq!(app.input, "next\n");
+}
+
+#[test]
 fn retry_command_resubmits_last_task_through_backend() {
     let _env_lock = lock_env();
     let temp_dir = unique_temp_dir("terminal-retry");
@@ -435,14 +541,6 @@ fn retry_command_resubmits_last_task_through_backend() {
     wait_for_prompt_log(&log_path, "retry me");
     let prompts = fs::read_to_string(&log_path).expect("backend log should exist");
     assert_eq!(prompts.lines().collect::<Vec<_>>(), vec!["retry me"]);
-}
-
-fn lock_env() -> MutexGuard<'static, ()> {
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 struct EnvVarGuard {

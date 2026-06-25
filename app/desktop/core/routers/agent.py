@@ -4,10 +4,10 @@ Agent 相关路由
 
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Optional
 from pathlib import Path
 
-from fastapi import APIRouter, File, Request, UploadFile
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from loguru import logger
 import shutil
@@ -19,26 +19,28 @@ from common.schemas.agent import (
     AgentAbilitiesRequest,
     AgentConfigDTO,
     AutoGenAgentRequest,
+    FileWorkspaceStatRequest,
     SystemPromptOptimizeRequest,
     convert_agent_to_config,
 )
 from common.services import agent_router_service, agent_service
 from common.services.agent_view_service import serialize_agent, serialize_agents
 from sagents.utils.agent_abilities import AgentAbilitiesGenerationError
+from app.desktop.core.sub_agent_selection import normalize_sub_agent_selection
 from ..user_context import get_desktop_user_id
 
 # 创建路由器
 agent_router = APIRouter(prefix="/api/agent", tags=["Agent"])
 
 
-def _resolve_request_language(http_request: Request, language: Optional[str] = None, default: str = "zh") -> str:
+def _resolve_request_language(
+    http_request: Request, language: Optional[str] = None, default: str = "zh"
+) -> str:
     candidate = (language or "").strip()
     if not candidate:
         headers = http_request.headers
         candidate = (
-            headers.get("x-accept-language")
-            or headers.get("accept-language")
-            or ""
+            headers.get("x-accept-language") or headers.get("accept-language") or ""
         ).strip()
     lowered = candidate.lower()
     if lowered.startswith("pt"):
@@ -55,33 +57,8 @@ def _normalize_desktop_sub_agent_selection(
     *,
     current_agent_id: str | None = None,
 ) -> None:
-    agent_mode = agent.agentMode or "simple"
-    if agent_mode != "fibre":
-        agent.subAgentSelectionMode = None
-        if agent.availableSubAgentIds is None:
-            agent.availableSubAgentIds = []
-        return
+    normalize_sub_agent_selection(agent, current_agent_id=current_agent_id)
 
-    if agent.subAgentSelectionMode not in {"auto_all", "manual"}:
-        existing_ids = [
-            sub_agent_id
-            for sub_agent_id in (agent.availableSubAgentIds or [])
-            if sub_agent_id and sub_agent_id != current_agent_id
-        ]
-        agent.subAgentSelectionMode = "manual" if existing_ids else "auto_all"
-
-    if agent.subAgentSelectionMode == "auto_all":
-        agent.availableSubAgentIds = []
-    else:
-        unique_ids: list[str] = []
-        seen = set()
-        for sub_agent_id in agent.availableSubAgentIds or []:
-            normalized_id = str(sub_agent_id or "").strip()
-            if not normalized_id or normalized_id == current_agent_id or normalized_id in seen:
-                continue
-            seen.add(normalized_id)
-            unique_ids.append(normalized_id)
-        agent.availableSubAgentIds = unique_ids
 
 @agent_router.get("/list")
 async def list(http_request: Request):
@@ -95,7 +72,9 @@ async def list(http_request: Request):
     all_configs = await agent_service.list_agents(user_id=user_id)
     agents_data = serialize_agents(all_configs)
     return await Response.succ(
-        data=agents_data, message=f"成功获取 {len(agents_data)} 个Agent配置"
+        data=agents_data,
+        message="agent.config_list_loaded",
+        message_params={"count": len(agents_data)},
     )
 
 
@@ -111,7 +90,9 @@ async def get_default_system_prompt(http_request: Request, language: str = "zh")
         StandardResponse: 包含默认System Prompt的内容
     """
     try:
-        resolved_language = _resolve_request_language(http_request, language, default="zh")
+        resolved_language = _resolve_request_language(
+            http_request, language, default="zh"
+        )
         result = await agent_router_service.build_default_system_prompt_response(
             language=resolved_language,
             blank_draft=True,
@@ -119,7 +100,8 @@ async def get_default_system_prompt(http_request: Request, language: str = "zh")
         return await Response.succ(data=result["data"], message=result["message"])
     except Exception as e:
         return await Response.error(
-            message=f"获取默认System Prompt模板失败: {str(e)}"
+            message="agent.default_prompt_failed",
+            message_params={"message": str(e)},
         )
 
 
@@ -134,15 +116,21 @@ async def create(agent: AgentConfigDTO, http_request: Request):
     Returns:
         StandardResponse: 包含操作结果的标准响应
     """
-    logger.info(f"[Agent Create] Received: id={agent.id}, name={agent.name}, is_default={agent.is_default}, im_channels={agent.im_channels}")
+    logger.info(
+        f"[Agent Create] Received: id={agent.id}, name={agent.name}, is_default={agent.is_default}, im_channels={agent.im_channels}"
+    )
 
     # 检查是否有启用的 IM 频道，如果有则自动添加 IM 工具
-    im_tools = ['send_message_through_im', 'send_file_through_im', 'send_image_through_im']
+    im_tools = [
+        "send_message_through_im",
+        "send_file_through_im",
+        "send_image_through_im",
+    ]
     has_enabled_im_channel = False
 
     if agent.im_channels:
         for provider, channel_data in agent.im_channels.items():
-            if channel_data.get('enabled', False):
+            if channel_data.get("enabled", False):
                 has_enabled_im_channel = True
                 break
 
@@ -159,19 +147,25 @@ async def create(agent: AgentConfigDTO, http_request: Request):
                 tools_added.append(tool_name)
 
         if tools_added:
-            logger.info(f"[Agent Create] Auto-added IM tools for agent={agent.id}: {tools_added}")
+            logger.info(
+                f"[Agent Create] Auto-added IM tools for agent={agent.id}: {tools_added}"
+            )
 
     _normalize_desktop_sub_agent_selection(agent, current_agent_id=agent.id)
 
     config_dict = convert_agent_to_config(agent)
-    logger.info(f"[Agent Create] Config dict: is_default={config_dict.get('is_default')}")
+    logger.info(
+        f"[Agent Create] Config dict: is_default={config_dict.get('is_default')}"
+    )
     created_agent = await agent_service.create_agent(
         agent.name,
         config_dict,
         user_id=get_desktop_user_id(http_request),
     )
     return await Response.succ(
-        data={"agent_id": created_agent.agent_id}, message=f"Agent '{created_agent.agent_id}' 创建成功"
+        data={"agent_id": created_agent.agent_id},
+        message="agent.created",
+        message_params={"agent_id": created_agent.agent_id},
     )
 
 
@@ -202,8 +196,12 @@ async def get(agent_id: str, http_request: Request):
     Returns:
         StandardResponse: 包含Agent配置的标准响应
     """
-    agent = await agent_service.get_agent(agent_id, user_id=get_desktop_user_id(http_request))
-    return await Response.succ(data=serialize_agent(agent), message="成功获取Agent配置")
+    agent = await agent_service.get_agent(
+        agent_id, user_id=get_desktop_user_id(http_request)
+    )
+    return await Response.succ(
+        data=serialize_agent(agent), message="agent.config_loaded"
+    )
 
 
 @agent_router.put("/{agent_id}")
@@ -218,15 +216,21 @@ async def update(agent_id: str, agent: AgentConfigDTO, http_request: Request):
     Returns:
         StandardResponse: 包含操作结果的标准响应
     """
-    logger.info(f"[Agent Update] Received update for agent={agent_id}, im_channels={agent.im_channels}")
+    logger.info(
+        f"[Agent Update] Received update for agent={agent_id}, im_channels={agent.im_channels}"
+    )
 
     # 检查是否有启用的 IM 频道，如果有则自动添加 IM 工具
-    im_tools = ['send_message_through_im', 'send_file_through_im', 'send_image_through_im']
+    im_tools = [
+        "send_message_through_im",
+        "send_file_through_im",
+        "send_image_through_im",
+    ]
     has_enabled_im_channel = False
 
     if agent.im_channels:
         for provider, channel_data in agent.im_channels.items():
-            if channel_data.get('enabled', False):
+            if channel_data.get("enabled", False):
                 has_enabled_im_channel = True
                 break
 
@@ -243,7 +247,9 @@ async def update(agent_id: str, agent: AgentConfigDTO, http_request: Request):
                 tools_added.append(tool_name)
 
         if tools_added:
-            logger.info(f"[Agent Update] Auto-added IM tools for agent={agent_id}: {tools_added}")
+            logger.info(
+                f"[Agent Update] Auto-added IM tools for agent={agent_id}: {tools_added}"
+            )
 
     _normalize_desktop_sub_agent_selection(agent, current_agent_id=agent_id)
 
@@ -254,67 +260,90 @@ async def update(agent_id: str, agent: AgentConfigDTO, http_request: Request):
         convert_agent_to_config(agent),
         user_id=get_desktop_user_id(http_request),
     )
-    
+
     # 保存 IM 渠道配置（如果存在）
     if agent.im_channels:
         logger.info(f"[Agent Update] Saving IM channels: {agent.im_channels}")
         try:
-            from mcp_servers.im_server.agent_config import get_agent_im_config, find_agent_by_provider_id
+            from mcp_servers.im_server.agent_config import (
+                get_agent_im_config,
+                find_agent_by_provider_id,
+            )
+
             agent_config = get_agent_im_config(agent_id)
-            
+
             # ID 字段映射
             id_field_map = {
                 "wechat_work": "bot_id",
                 "dingtalk": "client_id",
-                "feishu": "app_id"
+                "feishu": "app_id",
             }
-            
+
             for provider, channel_data in agent.im_channels.items():
-                enabled = channel_data.get('enabled', False)
-                config = channel_data.get('config', {})
-                
+                enabled = channel_data.get("enabled", False)
+                config = channel_data.get("config", {})
+
                 # 验证 iMessage 只能在默认 Agent 上启用
-                if provider == 'imessage' and enabled:
+                if provider == "imessage" and enabled:
                     dao = AgentConfigDao()
                     agent_obj = await dao.get_by_id(agent_id)
                     if agent_obj and not agent_obj.is_default:
-                        logger.warning(f"[Agent Update] iMessage can only be configured on default agent, skipping {agent_id}")
+                        logger.warning(
+                            f"[Agent Update] iMessage can only be configured on default agent, skipping {agent_id}"
+                        )
                         continue
-                
+
                 # 检查重复配置（仅对启用的渠道）
                 if enabled:
                     id_field = id_field_map.get(provider)
                     if id_field and config:
                         id_value = config.get(id_field)
                         if id_value:
-                            existing_agent = find_agent_by_provider_id(provider, id_value, exclude_agent_id=agent_id)
+                            existing_agent = find_agent_by_provider_id(
+                                provider, id_value, exclude_agent_id=agent_id
+                            )
                             if existing_agent:
                                 error_msg = f"{provider} 的 {id_field} '{id_value}' 已在 Agent '{existing_agent}' 配置，请勿重复配置"
-                                logger.warning(f"[Agent Update] Duplicate {provider} {id_field} detected: {id_value} between agents {agent_id} and {existing_agent}")
+                                logger.warning(
+                                    f"[Agent Update] Duplicate {provider} {id_field} detected: {id_value} between agents {agent_id} and {existing_agent}"
+                                )
                                 return await Response.error(code=400, message=error_msg)
-                
+
                 # 保存渠道配置
                 success = agent_config.set_provider_config(provider, enabled, config)
                 if success:
-                    logger.info(f"[Agent Update] Saved {provider} config for agent={agent_id}, enabled={enabled}")
-                    
+                    logger.info(
+                        f"[Agent Update] Saved {provider} config for agent={agent_id}, enabled={enabled}"
+                    )
+
                     # 如果启用，启动 IM 渠道
                     if enabled:
                         try:
-                            from mcp_servers.im_server.service_manager import get_service_manager
+                            from mcp_servers.im_server.service_manager import (
+                                get_service_manager,
+                            )
+
                             service_manager = get_service_manager()
-                            logger.info(f"[Agent Update] Starting {provider} channel for agent={agent_id}")
+                            logger.info(
+                                f"[Agent Update] Starting {provider} channel for agent={agent_id}"
+                            )
                             await service_manager.start_channel(agent_id, provider)
                         except Exception as e:
-                            logger.error(f"[Agent Update] Failed to start {provider} channel: {e}")
+                            logger.error(
+                                f"[Agent Update] Failed to start {provider} channel: {e}"
+                            )
                 else:
-                    logger.error(f"[Agent Update] Failed to save {provider} config for agent={agent_id}")
+                    logger.error(
+                        f"[Agent Update] Failed to save {provider} config for agent={agent_id}"
+                    )
         except Exception as e:
             logger.error(f"[Agent Update] Failed to save IM channels: {e}")
             # 不阻断主流程，仅记录错误
-    
+
     return await Response.succ(
-        data={"agent_id": agent_id}, message=f"Agent '{agent_id}' 更新成功"
+        data={"agent_id": agent_id},
+        message="agent.updated",
+        message_params={"agent_id": agent_id},
     )
 
 
@@ -329,8 +358,14 @@ async def delete(agent_id: str, http_request: Request):
     Returns:
         StandardResponse: 包含操作结果的标准响应
     """
-    await agent_service.delete_agent(agent_id, user_id=get_desktop_user_id(http_request))
-    return await Response.succ(data={"agent_id": agent_id}, message=f"Agent '{agent_id}' 删除成功")
+    await agent_service.delete_agent(
+        agent_id, user_id=get_desktop_user_id(http_request)
+    )
+    return await Response.succ(
+        data={"agent_id": agent_id},
+        message="agent.deleted",
+        message_params={"agent_id": agent_id},
+    )
 
 
 @agent_router.post("/{agent_id}/set-default")
@@ -345,18 +380,27 @@ async def set_default_agent(agent_id: str, http_request: Request):
         StandardResponse: 包含操作结果的标准响应
     """
     # 先检查 Agent 是否存在
-    agent = await agent_service.get_agent(agent_id, user_id=get_desktop_user_id(http_request))
+    agent = await agent_service.get_agent(
+        agent_id, user_id=get_desktop_user_id(http_request)
+    )
     if not agent:
-        return await Response.error(message=f"Agent '{agent_id}' 不存在")
-    
+        return await Response.error(
+            message="skill.agent_not_found",
+            message_params={"agent_id": agent_id},
+        )
+
     # 设置为默认
     dao = AgentConfigDao()
     success = await dao.set_default(agent_id)
-    
+
     if success:
-        return await Response.succ(data={"agent_id": agent_id}, message=f"Agent '{agent_id}' 已设为默认")
+        return await Response.succ(
+            data={"agent_id": agent_id},
+            message="agent.set_default_success",
+            message_params={"agent_id": agent_id},
+        )
     else:
-        return await Response.error(message=f"设置默认 Agent 失败")
+        return await Response.error(message="agent.set_default_failed")
 
 
 @agent_router.post("/auto-generate")
@@ -383,7 +427,9 @@ async def auto_generate(request: AutoGenAgentRequest, http_request: Request):
 async def get_agent_abilities(payload: AgentAbilitiesRequest, http_request: Request):
     """Desktop 端：生成指定 Agent 的能力卡片列表"""
     try:
-        language = _resolve_request_language(http_request, payload.language, default="zh")
+        language = _resolve_request_language(
+            http_request, payload.language, default="zh"
+        )
         logger.info(f"生成 Agent 语言: {language}")
         result = await agent_router_service.build_agent_abilities_response(
             agent_id=payload.agent_id,
@@ -395,12 +441,12 @@ async def get_agent_abilities(payload: AgentAbilitiesRequest, http_request: Requ
         )
         return await Response.succ(
             data=result["data"],
-            message="成功获取Agent能力列表",
+            message="agent.abilities_loaded",
         )
     except AgentAbilitiesGenerationError as e:
         logger.error(f"生成 Agent 能力列表失败: {e}")
         return await Response.error(
-            message="获取能力列表失败，请稍后重试",
+            message="agent.abilities_failed",
             error_detail=str(e),
         )
 
@@ -455,20 +501,33 @@ async def download_file(agent_id: str, request: Request):
     logger.bind(agent_id=agent_id).info(f"Download request: file_path={file_path}")
     user_home = Path.home()
     sage_home = user_home / ".sage"
-    workspace_path = sage_home / "agents" / agent_id
+    sage_home / "agents" / agent_id  # pyright: ignore[reportUnusedExpression]
 
     try:
         path, filename, media_type = await agent_service.download_desktop_agent_file(
             agent_id,
-            file_path,
+            file_path,  # pyright: ignore[reportArgumentType]
         )
         logger.bind(agent_id=agent_id).info(f"Download resolved: path={path}")
-        return FileResponse(
-            path=path, filename=filename, media_type=media_type
-        )
+        return FileResponse(path=path, filename=filename, media_type=media_type)
     except Exception as e:
         logger.bind(agent_id=agent_id).error(f"Download failed: {e}")
         raise
+
+
+@agent_router.post("/{agent_id}/file_workspace/stat")
+async def stat_files(
+    agent_id: str,
+    body: FileWorkspaceStatRequest,
+    request: Request,
+    session_id: Optional[str] = None,
+):
+    result = await agent_service.stat_desktop_agent_files(
+        agent_id,
+        body.paths,
+        session_id=session_id,
+    )
+    return await Response.succ(message="agent.file_metadata_loaded", data=result)
 
 
 @agent_router.get("/{agent_id}/file_workspace/stream")
@@ -480,7 +539,7 @@ async def stream_file(agent_id: str, request: Request):
     try:
         path, filename, media_type = await agent_service.download_desktop_agent_file(
             agent_id,
-            file_path,
+            file_path,  # pyright: ignore[reportArgumentType]
         )
     except Exception as e:
         logger.bind(agent_id=agent_id).error(f"Stream resolve failed: {e}")
@@ -538,12 +597,15 @@ async def delete_file(agent_id: str, request: Request):
     logger.bind(agent_id=agent_id).info(f"Delete request: file_path={file_path}")
     user_home = Path.home()
     sage_home = user_home / ".sage"
-    workspace_path = sage_home / "agents" / agent_id
+    sage_home / "agents" / agent_id  # pyright: ignore[reportUnusedExpression]
 
     try:
         result = await agent_router_service.build_workspace_delete_response(
-            file_path=file_path,
-            deleter=lambda: agent_service.delete_desktop_agent_file(agent_id, file_path),
+            file_path=file_path,  # pyright: ignore[reportArgumentType]
+            deleter=lambda: agent_service.delete_desktop_agent_file(
+                agent_id,
+                file_path,  # pyright: ignore[reportArgumentType]
+            ),
         )
         return await Response.succ(message=result["message"], data=result["data"])
     except Exception as e:
@@ -552,51 +614,31 @@ async def delete_file(agent_id: str, request: Request):
 
 
 @agent_router.post("/{agent_id}/file_workspace/upload")
-async def upload_file(agent_id: str, file: UploadFile = File(...), target_path: str = ""):
+async def upload_file(
+    agent_id: str,
+    file: UploadFile = File(...),
+    target_path: str = Form(""),
+):
     """上传文件到Agent工作空间"""
-    logger.bind(agent_id=agent_id).info(f"Upload request: filename={file.filename}, target_path={target_path}")
-    user_home = Path.home()
-    sage_home = user_home / ".sage"
-    workspace_path = sage_home / "agents" / agent_id
-    
+    logger.bind(agent_id=agent_id).info(
+        f"Upload request: filename={file.filename}, target_path={target_path}"
+    )
+
     try:
-        # 确保工作空间目录存在
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        
-        # 构建目标文件路径
-        if target_path:
-            # 如果指定了目标路径，创建子目录
-            target_dir = workspace_path / target_path
-            target_dir.mkdir(parents=True, exist_ok=True)
-            file_path = target_dir / file.filename
-        else:
-            file_path = workspace_path / file.filename
-        
-        # 安全检查：确保文件路径在工作空间内
-        workspace_abs = os.path.normcase(os.path.abspath(workspace_path))
-        file_abs = os.path.normcase(os.path.abspath(file_path))
-        try:
-            in_workspace = os.path.commonpath([workspace_abs, file_abs]) == workspace_abs
-        except ValueError:
-            in_workspace = False
-        
-        if not in_workspace:
-            raise SageHTTPException(status_code=400, detail="访问被拒绝：文件路径超出工作空间范围")
-        
-        # 保存文件
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        file_size = os.path.getsize(file_path)
-        logger.bind(agent_id=agent_id).info(f"Upload successful: {file_path}, size={file_size}")
-        
+        result = await agent_service.upload_desktop_agent_file(
+            agent_id,
+            file.filename,  # pyright: ignore[reportArgumentType]
+            file.file,
+            target_path,
+        )
+        logger.bind(agent_id=agent_id).info(
+            f"Upload successful: path={result['path']}, size={result['size']}"
+        )
+
         return await Response.succ(
-            message=f"文件 {file.filename} 上传成功",
-            data={
-                "filename": file.filename,
-                "path": str(file_path.relative_to(workspace_path)),
-                "size": file_size,
-            }
+            message="agent.file_uploaded",
+            message_params={"filename": file.filename},
+            data=result,
         )
     except Exception as e:
         logger.bind(agent_id=agent_id).error(f"Upload failed: {e}")
@@ -606,73 +648,82 @@ async def upload_file(agent_id: str, file: UploadFile = File(...), target_path: 
 @agent_router.post("/{agent_id}/file_workspace/upload_folder")
 async def upload_folder(agent_id: str, request: Request):
     """上传文件夹到Agent工作空间（通过文件列表）"""
-    logger.bind(agent_id=agent_id).info(f"Upload folder request")
+    logger.bind(agent_id=agent_id).info("Upload folder request")
     user_home = Path.home()
     sage_home = user_home / ".sage"
     workspace_path = sage_home / "agents" / agent_id
-    
+
     try:
         data = await request.json()
         files = data.get("files", [])
         target_folder = data.get("target_folder", "")
-        
+
         if not files:
-            raise SageHTTPException(status_code=400, detail="没有要上传的文件")
-        
+            raise SageHTTPException(
+                status_code=400, message_key="agent.upload_files_required"
+            )
+
         # 确保工作空间目录存在
         workspace_path.mkdir(parents=True, exist_ok=True)
-        
+
         # 构建目标目录
         if target_folder:
             target_dir = workspace_path / target_folder
             target_dir.mkdir(parents=True, exist_ok=True)
         else:
             target_dir = workspace_path
-        
+
         uploaded_files = []
-        
+
         for file_info in files:
             relative_path = file_info.get("relative_path", "")
             source_path = file_info.get("source_path", "")
-            
+
             if not source_path or not os.path.exists(source_path):
                 logger.warning(f"Source file not found: {source_path}")
                 continue
-            
+
             # 构建目标文件路径
             if relative_path:
                 dest_path = target_dir / relative_path
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
             else:
                 dest_path = target_dir / os.path.basename(source_path)
-            
+
             # 安全检查
             workspace_abs = os.path.normcase(os.path.abspath(workspace_path))
             dest_abs = os.path.normcase(os.path.abspath(dest_path))
             try:
-                in_workspace = os.path.commonpath([workspace_abs, dest_abs]) == workspace_abs
+                in_workspace = (
+                    os.path.commonpath([workspace_abs, dest_abs]) == workspace_abs
+                )
             except ValueError:
                 in_workspace = False
-            
+
             if not in_workspace:
                 logger.warning(f"Path outside workspace: {dest_path}")
                 continue
-            
+
             # 复制文件
             shutil.copy2(source_path, dest_path)
             file_size = os.path.getsize(dest_path)
-            
-            uploaded_files.append({
-                "filename": os.path.basename(source_path),
-                "path": str(dest_path.relative_to(workspace_path)),
-                "size": file_size,
-            })
-        
-        logger.bind(agent_id=agent_id).info(f"Folder upload successful: {len(uploaded_files)} files")
-        
+
+            uploaded_files.append(
+                {
+                    "filename": os.path.basename(source_path),
+                    "path": str(dest_path.relative_to(workspace_path)),
+                    "size": file_size,
+                }
+            )
+
+        logger.bind(agent_id=agent_id).info(
+            f"Folder upload successful: {len(uploaded_files)} files"
+        )
+
         return await Response.succ(
-            message=f"成功上传 {len(uploaded_files)} 个文件",
-            data={"files": uploaded_files}
+            message="agent.files_uploaded",
+            message_params={"count": len(uploaded_files)},
+            data={"files": uploaded_files},
         )
     except Exception as e:
         logger.bind(agent_id=agent_id).error(f"Folder upload failed: {e}")

@@ -2,6 +2,10 @@ use std::time::Instant;
 
 use ratatui::text::Line;
 
+use crate::app::live_filter::{
+    clean_assistant_live_text, filter_completed_duplicate_assistant_lines,
+    filter_final_duplicate_assistant_text,
+};
 use crate::app::runtime_support::{
     backend_phase_timing_summary, backend_tool_step_summary, duration_from_seconds,
     flush_completed_live_lines, format_duration, normalize_phase_label, request_timing_summary,
@@ -61,43 +65,16 @@ impl App {
     }
 
     pub fn complete_request(&mut self) {
-        self.busy = false;
-        self.current_task = None;
-        let backend_stats = self.pending_backend_stats.take();
-        self.last_request_duration = backend_stats
-            .as_ref()
-            .and_then(|stats| duration_from_seconds(stats.elapsed_seconds))
-            .or_else(|| self.request_started_at.map(|started| started.elapsed()));
-        self.last_first_output_latency = backend_stats
-            .as_ref()
-            .and_then(|stats| duration_from_seconds(stats.first_output_seconds))
-            .or(self.first_output_latency);
-        let completion_summary = request_timing_summary(
-            self.last_request_duration,
-            self.last_first_output_latency,
-            backend_stats.as_ref(),
-        );
-        self.request_started_at = None;
-        self.first_output_latency = None;
-        self.active_phase = None;
-        self.active_tools.clear();
-        self.flush_live_message();
-        let mut completion_lines = Vec::new();
-        if let Some(stats) = backend_stats.as_ref() {
-            if let Some(tool_summary) =
-                backend_tool_step_summary(&stats.tool_steps, self.display_mode)
-            {
-                completion_lines.push(tool_summary);
-            }
-            if let Some(phase_summary) =
-                backend_phase_timing_summary(&stats.phase_timings, self.display_mode)
-            {
-                completion_lines.push(phase_summary);
-            }
+        let had_active_request = self.busy
+            || self.current_task.is_some()
+            || self.request_started_at.is_some()
+            || self.live_message.is_some()
+            || self.pending_backend_stats.is_some();
+        if !had_active_request {
+            return;
         }
-        if let Some(summary) = completion_summary {
-            completion_lines.push(format!("completed • {summary}"));
-        }
+
+        let completion_lines = self.finish_request_state("completed");
         if !completion_lines.is_empty() {
             self.queue_message(MessageKind::Process, completion_lines.join("\n"));
         }
@@ -105,43 +82,7 @@ impl App {
     }
 
     pub fn fail_request(&mut self, message: impl Into<String>) {
-        self.busy = false;
-        self.current_task = None;
-        let backend_stats = self.pending_backend_stats.take();
-        self.last_request_duration = backend_stats
-            .as_ref()
-            .and_then(|stats| duration_from_seconds(stats.elapsed_seconds))
-            .or_else(|| self.request_started_at.map(|started| started.elapsed()));
-        self.last_first_output_latency = backend_stats
-            .as_ref()
-            .and_then(|stats| duration_from_seconds(stats.first_output_seconds))
-            .or(self.first_output_latency);
-        let completion_summary = request_timing_summary(
-            self.last_request_duration,
-            self.last_first_output_latency,
-            backend_stats.as_ref(),
-        );
-        self.request_started_at = None;
-        self.first_output_latency = None;
-        self.active_phase = None;
-        self.active_tools.clear();
-        self.flush_live_message();
-        let mut completion_lines = Vec::new();
-        if let Some(stats) = backend_stats.as_ref() {
-            if let Some(tool_summary) =
-                backend_tool_step_summary(&stats.tool_steps, self.display_mode)
-            {
-                completion_lines.push(tool_summary);
-            }
-            if let Some(phase_summary) =
-                backend_phase_timing_summary(&stats.phase_timings, self.display_mode)
-            {
-                completion_lines.push(phase_summary);
-            }
-        }
-        if let Some(summary) = completion_summary {
-            completion_lines.push(format!("failed • {summary}"));
-        }
+        let completion_lines = self.finish_request_state("failed");
         if !completion_lines.is_empty() {
             self.queue_message(MessageKind::Process, completion_lines.join("\n"));
         }
@@ -175,6 +116,7 @@ impl App {
             self.last_request_duration,
             self.last_first_output_latency,
             backend_stats.as_ref(),
+            self.display_mode,
         );
         self.busy = false;
         self.current_task = None;
@@ -183,6 +125,7 @@ impl App {
         self.active_phase = None;
         self.active_tools.clear();
         self.flush_live_message();
+        self.reset_assistant_live_filter();
 
         let mut lines = Vec::new();
         if let Some(summary) = completion_summary {
@@ -197,6 +140,52 @@ impl App {
         }
         self.queue_message(MessageKind::Process, lines.join("\n"));
         self.status = format!("interrupted  {}", self.session_label());
+    }
+
+    fn finish_request_state(&mut self, outcome: &str) -> Vec<String> {
+        self.busy = false;
+        self.current_task = None;
+        let backend_stats = self.pending_backend_stats.take();
+        self.last_request_duration = backend_stats
+            .as_ref()
+            .and_then(|stats| duration_from_seconds(stats.elapsed_seconds))
+            .or_else(|| self.request_started_at.map(|started| started.elapsed()));
+        self.last_first_output_latency = backend_stats
+            .as_ref()
+            .and_then(|stats| duration_from_seconds(stats.first_output_seconds))
+            .or(self.first_output_latency);
+        let completion_summary = request_timing_summary(
+            self.last_request_duration,
+            self.last_first_output_latency,
+            backend_stats.as_ref(),
+            self.display_mode,
+        );
+        self.request_started_at = None;
+        self.first_output_latency = None;
+        self.active_phase = None;
+        self.active_tools.clear();
+        self.flush_live_message();
+        self.reset_assistant_live_filter();
+
+        let mut completion_lines = Vec::new();
+        if matches!(self.display_mode, DisplayMode::Verbose) {
+            if let Some(stats) = backend_stats.as_ref() {
+                if let Some(tool_summary) =
+                    backend_tool_step_summary(&stats.tool_steps, self.display_mode)
+                {
+                    completion_lines.push(tool_summary);
+                }
+                if let Some(phase_summary) =
+                    backend_phase_timing_summary(&stats.phase_timings, self.display_mode)
+                {
+                    completion_lines.push(phase_summary);
+                }
+            }
+        }
+        if let Some(summary) = completion_summary {
+            completion_lines.push(format!("{outcome} • {summary}"));
+        }
+        completion_lines
     }
 
     pub fn rendered_live_lines(&self) -> Vec<Line<'static>> {
@@ -214,16 +203,30 @@ impl App {
                         false,
                     )
                 } else if let Some(phase) = self.active_phase_label() {
-                    format_message_continuation(
-                        MessageKind::Process,
-                        &format!("{phase}..."),
-                        false,
-                    )
+                    format_message_continuation(MessageKind::Process, &format!("{phase}..."), false)
                 } else {
                     format_message_continuation(MessageKind::Process, "working...", false)
                 }
             }
         }
+    }
+
+    pub fn rendered_main_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let has_transcript =
+            !self.committed_history_lines.is_empty() || !self.pending_history_lines.is_empty();
+        let mut lines = if has_transcript || self.busy {
+            Vec::new()
+        } else {
+            self.rendered_idle_lines(width)
+        };
+        if self.busy {
+            let live_lines = self.rendered_live_lines();
+            if !lines.is_empty() && !live_lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.extend(live_lines);
+        }
+        lines
     }
 
     pub fn rendered_idle_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -234,14 +237,16 @@ impl App {
             return Vec::new();
         }
 
+        let agent_label = self.active_agent_label();
         welcome_lines(
             width,
-            self.session_label(),
-            self.selected_agent_id.as_deref(),
-            &self.agent_mode,
+            &self.session_id,
+            &agent_label,
+            &self.agent_mode_status_label(),
             self.display_mode,
-            self.max_loop_count,
+            &self.max_loop_count_status_label(),
             &self.workspace_label,
+            &self.sandbox_type_status_label(),
             self.current_goal
                 .as_ref()
                 .map(|goal| (goal.objective.as_str(), goal.status.as_str())),
@@ -334,18 +339,14 @@ impl App {
         let started_at = Instant::now();
         self.active_tools
             .insert(name.clone(), ActiveToolRecord { step, started_at });
-        if !show_detail {
+        if !show_detail || matches!(self.display_mode, DisplayMode::Compact) {
             return;
         }
         let since_request = self
             .request_started_at
             .map(|started| format!(" • +{}", format_duration(started.elapsed())))
             .unwrap_or_default();
-        let detail = if matches!(self.display_mode, DisplayMode::Verbose) {
-            format!("step {}  running {name}{since_request}", self.tool_step_seq)
-        } else {
-            format!("running {name}{since_request}")
-        };
+        let detail = format!("step {}  running {name}{since_request}", self.tool_step_seq);
         self.queue_message(MessageKind::Tool, detail);
     }
 
@@ -355,48 +356,33 @@ impl App {
             .active_tools
             .remove(&name)
             .map(|record| {
-                if matches!(self.display_mode, DisplayMode::Verbose) {
-                    format!(
-                        "step {}  completed {} • {}",
-                        record.step,
-                        name,
-                        format_duration(record.started_at.elapsed())
-                    )
-                } else {
-                    format!(
-                        "completed {} • {}",
-                        name,
-                        format_duration(record.started_at.elapsed())
-                    )
-                }
+                format!(
+                    "step {}  completed {} • {}",
+                    record.step,
+                    name,
+                    format_duration(record.started_at.elapsed())
+                )
             })
             .unwrap_or_else(|| format!("completed {name}"));
-        if !show_detail {
+        if !show_detail || matches!(self.display_mode, DisplayMode::Compact) {
             return;
         }
         self.queue_message(MessageKind::Tool, detail);
     }
 
     pub(crate) fn materialize_pending_ui(&mut self, width: u16) {
-        if !self.pending_welcome_banner || self.pending_history_lines.is_empty() {
+        if !self.pending_welcome_banner
+            || !self.committed_history_lines.is_empty()
+            || self.pending_history_lines.is_empty()
+        {
             return;
         }
 
-        let mut lines = welcome_lines(
-            width,
-            &self.session_id,
-            self.selected_agent_id.as_deref(),
-            &self.agent_mode,
-            self.display_mode,
-            self.max_loop_count,
-            &self.workspace_label,
-            self.current_goal
-                .as_ref()
-                .map(|goal| (goal.objective.as_str(), goal.status.as_str())),
-        );
-        lines.append(&mut self.pending_history_lines);
+        let mut lines = self.rendered_idle_lines(width);
+        lines.extend(std::mem::take(&mut self.pending_history_lines));
         self.pending_history_lines = lines;
         self.pending_welcome_banner = false;
+        self.clear_requested = true;
     }
 
     pub(super) fn append_live_chunk(&mut self, kind: MessageKind, chunk: &str) {
@@ -407,6 +393,14 @@ impl App {
         match self.live_message.as_mut() {
             Some((current_kind, text)) if *current_kind == kind => {
                 text.push_str(chunk);
+                if kind == MessageKind::Assistant {
+                    clean_assistant_live_text(text);
+                    filter_completed_duplicate_assistant_lines(
+                        text,
+                        &mut self.assistant_live_seen_lines,
+                        &mut self.assistant_live_in_code_block,
+                    );
+                }
                 self.live_message_had_history |= flush_completed_live_lines(
                     &mut self.pending_history_lines,
                     *current_kind,
@@ -417,6 +411,14 @@ impl App {
             Some(_) => {
                 self.flush_live_message();
                 let mut text = chunk.to_string();
+                if kind == MessageKind::Assistant {
+                    clean_assistant_live_text(&mut text);
+                    filter_completed_duplicate_assistant_lines(
+                        &mut text,
+                        &mut self.assistant_live_seen_lines,
+                        &mut self.assistant_live_in_code_block,
+                    );
+                }
                 self.live_message_had_history = flush_completed_live_lines(
                     &mut self.pending_history_lines,
                     kind,
@@ -427,6 +429,14 @@ impl App {
             }
             None => {
                 let mut text = chunk.to_string();
+                if kind == MessageKind::Assistant {
+                    clean_assistant_live_text(&mut text);
+                    filter_completed_duplicate_assistant_lines(
+                        &mut text,
+                        &mut self.assistant_live_seen_lines,
+                        &mut self.assistant_live_in_code_block,
+                    );
+                }
                 self.live_message_had_history = flush_completed_live_lines(
                     &mut self.pending_history_lines,
                     kind,
@@ -441,6 +451,18 @@ impl App {
     pub(super) fn flush_live_message(&mut self) {
         if let Some((kind, text)) = self.live_message.take() {
             if !text.trim().is_empty() {
+                let mut text = text;
+                if kind == MessageKind::Assistant {
+                    filter_final_duplicate_assistant_text(
+                        &mut text,
+                        &mut self.assistant_live_seen_lines,
+                        &mut self.assistant_live_in_code_block,
+                    );
+                }
+                if text.trim().is_empty() {
+                    self.live_message_had_history = false;
+                    return;
+                }
                 if self.live_message_had_history {
                     self.pending_history_lines
                         .extend(format_message_continuation(kind, &text, true));
@@ -450,6 +472,17 @@ impl App {
             }
         }
         self.live_message_had_history = false;
+    }
+
+    pub(crate) fn clear_live_response_state(&mut self) {
+        self.live_message = None;
+        self.live_message_had_history = false;
+        self.reset_assistant_live_filter();
+    }
+
+    fn reset_assistant_live_filter(&mut self) {
+        self.assistant_live_seen_lines.clear();
+        self.assistant_live_in_code_block = false;
     }
 
     pub(super) fn queue_message(&mut self, kind: MessageKind, text: impl Into<String>) {

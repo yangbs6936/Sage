@@ -16,7 +16,9 @@ class TestCliErrorHandling(unittest.TestCase):
         payload = _build_cli_error_payload(exc, verbose=True)
 
         self.assertEqual(payload["message"], "Workspace path is not writable")
-        self.assertEqual(payload["next_steps"], ["Choose a writable `--workspace` path."])
+        self.assertEqual(
+            payload["next_steps"], ["Choose a writable `--workspace` path."]
+        )
         self.assertEqual(payload["debug_detail"], "debug-info")
 
     def test_build_payload_from_module_not_found_adds_install_hint(self):
@@ -37,6 +39,30 @@ class TestCliErrorHandling(unittest.TestCase):
         with self.assertRaises(CLIError) as ctx:
             validate_cli_request_options(workspace=None, max_loop_count=0)
         self.assertIn("Invalid max loop count", str(ctx.exception))
+
+    def test_validate_request_options_rejects_bool_loop_count(self):
+        with self.assertRaises(CLIError) as ctx:
+            validate_cli_request_options(workspace=None, max_loop_count=True)
+        self.assertIn("Invalid max loop count", str(ctx.exception))
+
+    def test_validate_request_options_rejects_non_numeric_loop_count(self):
+        with self.assertRaises(CLIError) as ctx:
+            validate_cli_request_options(workspace=None, max_loop_count="many")
+        self.assertIn("Invalid max loop count", str(ctx.exception))
+
+    def test_validate_request_options_rejects_non_integer_loop_count(self):
+        with self.assertRaises(CLIError) as ctx:
+            validate_cli_request_options(workspace=None, max_loop_count=3.5)
+        self.assertIn("Invalid max loop count", str(ctx.exception))
+
+    def test_validate_request_options_rejects_unknown_sandbox_type(self):
+        with self.assertRaises(CLIError) as ctx:
+            validate_cli_request_options(
+                workspace=None,
+                max_loop_count=50,
+                sandbox_type="unsafe",
+            )
+        self.assertIn("Unsupported sandbox type", str(ctx.exception))
 
 
 if __name__ == "__main__":

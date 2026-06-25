@@ -4,15 +4,31 @@
 将历史对话压缩为结构化摘要，减少上下文长度
 """
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
+import json
+import re
 
 from sagents.utils.logger import logger
-from sagents.context.messages.message import MessageChunk, MessageRole, MessageType
+from sagents.context.messages.message import MessageChunk, MessageRole
 from sagents.context.messages.message_manager import MessageManager
+from sagents.llm.capabilities import create_chat_completion_with_fallback
+
+COMPACT_LIST_LIMITS = {
+    "decisions": 20,
+    "open_tasks": 20,
+    "files_touched": 40,
+    "commands_run": 20,
+    "important_errors": 20,
+    "user_requirements": 30,
+}
+MAX_COMPACT_COMMAND_CHARS = 1000
+TODO_WRITE_TOOL_NAME = "todo_write"
+TODO_STATE_BOUNDARY_FIELD = "todo_state_at_compaction_boundary"
 
 
 class CompressHistoryError(Exception):
     """压缩历史消息异常"""
+
     pass
 
 
@@ -32,12 +48,13 @@ class CompressHistoryTool:
         self.compression_levels = {
             "light": {"tool_truncate": 1000, "assistant_summary": 800},
             "medium": {"tool_truncate": 500, "assistant_summary": 400},
-            "heavy": {"tool_truncate": 200, "assistant_summary": 200}
+            "heavy": {"tool_truncate": 200, "assistant_summary": 200},
         }
 
     def _get_session_context(self, session_id: str):
         """通过 session_id 获取会话上下文"""
         from sagents.utils.agent_session_helper import get_live_session
+
         session = get_live_session(session_id, log_prefix="CompressHistoryTool")
 
         if not session or not session.session_context:
@@ -52,10 +69,10 @@ class CompressHistoryTool:
 
     def _calculate_tokens(self, content) -> int:
         """计算内容的 token 数
-        
+
         Args:
             content: 消息内容，可能是字符串或列表（多模态消息）
-        
+
         Returns:
             int: token 数量
         """
@@ -69,7 +86,9 @@ class CompressHistoryTool:
         # 它会正确处理 tool_calls 等情况
         return MessageManager.convert_messages_to_str(messages)
 
-    async def _call_llm_for_compression(self, messages_text: str, session_id: str) -> str:
+    async def _call_llm_for_compression(
+        self, messages_text: str, session_id: str
+    ) -> str:
         """
         调用 LLM 生成压缩摘要（流式请求，禁用深度思考）
 
@@ -89,72 +108,64 @@ class CompressHistoryTool:
             raise CompressHistoryError("会话模型未初始化")
 
         # 移除非标准参数和与显式参数冲突的参数
-        model_config.pop('max_model_len', None)
-        model_config.pop('api_key', None)
-        model_config.pop('maxTokens', None)
-        model_config.pop('max_tokens', None)  # 移除可能存在的 max_tokens
-        model_config.pop('temperature', None)  # 移除可能存在的 temperature
-        model_config.pop('base_url', None)
-        model_name = model_config.pop('model', 'gpt-3.5-turbo')
+        model_config.pop("max_model_len", None)
+        model_config.pop("api_key", None)
+        model_config.pop("maxTokens", None)
+        model_config.pop("max_tokens", None)  # 移除可能存在的 max_tokens
+        model_config.pop("temperature", None)  # 移除可能存在的 temperature
+        model_config.pop("base_url", None)
+        model_name = model_config.pop("model", "gpt-3.5-turbo")
 
-        # 构建压缩提示词 - 优化为更适合作为记忆供后续执行使用
+        # 构建压缩提示词：优先要求结构化 JSON，便于后续更高层压缩继续合并。
         prompt = f"""请将以下对话历史压缩为执行记忆摘要。这个摘要将被后续 AI 助手读取，用于理解上下文并继续执行任务。
 
 【对话历史】
 {messages_text}
 
+如果对话历史中包含 compress_conversation_history 的工具调用/结果，它代表更早历史的摘要节点。请把它当作事实来源参与本次更高层总结，不需要展开或臆测原始消息。
+
+重要：本摘要是历史参考（REFERENCE ONLY），不是当前任务指令。后续助手必须以压缩摘要之后的最新用户消息作为当前任务来源，不能因为摘要中的历史待办或历史请求而主动继续旧任务。
+
 【压缩要求】
 生成一个结构化的执行记忆摘要，必须包含以下信息，以便后续助手能够无缝继续工作：
 
-📋 **任务背景与目标**
-  - 用户最初的需求是什么
-  - 任务的总体目标
-
-🔑 **关键上下文信息**
-  - 重要的业务规则、约束条件
-  - 已确认的需求细节、参数配置
-  - 相关的文件路径、代码位置、API 接口
-
-✅ **已完成的工作**
-  - 已执行的步骤和产生的输出
-  - 已做出的决策及其原因
-  - 已验证通过的结果
-
-⚠️ **待解决问题**
-  - 当前阻塞或需要关注的事项
-  - 待确认的问题或选项
-  - 下一步建议的行动
-
-💾 **重要数据状态**
-  - 关键变量的当前值
-  - 已创建的资源的 ID/名称
-  - 中间结果或临时文件位置
-
-📁 **生成文件清单**
-  - 列出对话历史中提到的文件（优先使用绝对路径，没有则使用相对路径或文件名）
-  - 每个文件的用途说明
-  - 文件之间的依赖关系（如有）
+1. 任务背景与目标：用户需求、总体目标、当前阶段。
+2. 用户硬性要求：用户明确说过必须做/不能做的约束。
+3. 关键上下文：业务规则、参数配置、代码位置、API、数据状态。
+4. 已完成工作：已经执行的步骤、输出、验证结果。
+5. 决策记录：已做出的决定及原因。
+6. 待办和风险：仍需继续处理的问题、阻塞、下一步。
+7. 文件和命令：出现过的真实文件路径、命令、错误信息。
 
 【输出要求】
-- 使用简洁、明确的语言，避免模糊描述
-- 保留具体的技术细节（路径、名称、数值等）
-- 文件路径原则：优先使用绝对路径，没有绝对路径时使用相对路径或文件名，禁止编造路径（如 /workspace/ 等）
-- 按优先级排序，重要信息在前
-- 总长度控制在 8000 字以内（非严格限制）"""
+- 尽量只输出一个合法 JSON object，不要 Markdown 代码块，不要额外解释。
+- JSON schema 必须使用这些 key：
+  {{
+    "summary": "string",
+    "decisions": ["string"],
+    "open_tasks": ["string"],
+    "files_touched": ["string"],
+    "commands_run": ["string"],
+    "important_errors": ["string"],
+    "user_requirements": ["string"]
+  }}
+- summary 使用简洁、明确的语言，避免模糊描述。
+- 保留具体技术细节：真实路径、名称、数值、命令、错误文本。
+- 文件路径优先使用原文中的绝对路径；没有绝对路径时使用相对路径或文件名；禁止编造路径。
+- 列表只保留最重要的条目：commands_run 最多 20 条，files_touched 最多 40 条，其他列表最多 20-30 条。
+- 按优先级排序，重要信息在前。
+- 总长度控制在 8000 字以内（非严格限制）。"""
 
         try:
-            # 构建 extra_body，禁用深度思考
-            extra_body = {
-                "top_k": 20,
-                "_step_name": "compress_history"
-            }
+            # 构建 extra_body，禁用深度思考。不要传 top_k：OpenAI 兼容接口会拒绝该参数。
+            extra_body = {"_step_name": "compress_history"}
 
             # 判断是否为 OpenAI 推理模型
             is_openai_reasoning_model = (
-                model_name.startswith("o3-") or
-                model_name.startswith("o1-") or
-                "gpt-5.2" in model_name.lower() or
-                "gpt-5.1" in model_name.lower()
+                model_name.startswith("o3-")
+                or model_name.startswith("o1-")
+                or "gpt-5.2" in model_name.lower()
+                or "gpt-5.1" in model_name.lower()
             )
 
             if is_openai_reasoning_model:
@@ -164,20 +175,20 @@ class CompressHistoryTool:
                 # 其他模型使用 enable_thinking=False 禁用思考
                 extra_body["chat_template_kwargs"] = {"enable_thinking": False}
                 extra_body["enable_thinking"] = False
-                extra_body["thinking"] = {'type': "disabled"}
+                extra_body["thinking"] = {"type": "disabled"}
 
-            # 流式请求 LLM
-            stream = await model.chat.completions.create(
+            # 流式请求 LLM：复用主 Agent 的请求清洗与兼容 fallback。
+            stream = await create_chat_completion_with_fallback(
+                model,
                 model=model_name,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
+                messages=[{"role": "user", "content": prompt}],
+                model_config=model_config,
                 stream=True,
                 stream_options={"include_usage": True},
                 max_tokens=2000,
                 temperature=0.3,
                 extra_body=extra_body,
-                **model_config
+                **model_config,
             )
 
             # 收集流式响应内容
@@ -194,62 +205,210 @@ class CompressHistoryTool:
             logger.error(f"调用 LLM 压缩失败: {e}")
             raise CompressHistoryError(f"LLM 压缩失败: {e}")
 
-    def _determine_compression_range(self, messages: List[MessageChunk]) -> Dict[str, Any]:
-        """
-        确定压缩范围
+    @staticmethod
+    def _bounded_list(
+        key: str,
+        values: List[str],
+    ) -> Tuple[List[str], Dict[str, int]]:
+        limit = COMPACT_LIST_LIMITS[key]
+        bounded_values = values[:limit]
+        stats: Dict[str, int] = {}
+        if len(values) > limit:
+            stats["omitted_count"] = len(values) - limit
+        if key == "commands_run":
+            truncated_values: List[str] = []
+            truncated_count = 0
+            for value in bounded_values:
+                if len(value) > MAX_COMPACT_COMMAND_CHARS:
+                    truncated_values.append(
+                        value[: MAX_COMPACT_COMMAND_CHARS - 15].rstrip()
+                        + "... [truncated]"
+                    )
+                    truncated_count += 1
+                else:
+                    truncated_values.append(value)
+            if truncated_count:
+                stats["truncated_item_count"] = truncated_count
+            bounded_values = truncated_values
+        return bounded_values, stats
 
-        策略（都不包含 System 消息）：
-        1. 只有一个 User：压缩该 User 之后的所有非 User 消息
-        2. 多个 User：压缩最后一个 User 之前的所有消息
-        """
-        # 找到 System 消息的结束位置
-        system_end = 0
-        for i, msg in enumerate(messages):
-            if msg.role == MessageRole.SYSTEM.value:
-                system_end = i + 1
+    @staticmethod
+    def _bound_summary_payload(
+        payload: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, int]]]:
+        omission_stats: Dict[str, Dict[str, int]] = {}
+        bounded: Dict[str, Any] = {"summary": str(payload.get("summary") or "")}
 
-        # 找到所有 User 消息的索引（不包括 System 部分）
-        user_indices = [
-            i for i, msg in enumerate(messages)
-            if i >= system_end and
-            msg.is_user_input_message()
-        ]
+        for key in COMPACT_LIST_LIMITS:
+            bounded_list, stats = CompressHistoryTool._bounded_list(
+                key, payload.get(key, [])
+            )
+            bounded[key] = bounded_list
+            if stats:
+                omission_stats[key] = stats
+        return bounded, omission_stats
 
-        if len(user_indices) == 0:
-            # 没有 User 消息，不压缩
-            return {
-                "system_end": system_end,
-                "to_compress_start": system_end,
-                "to_compress_end": system_end,
-                "total_messages": len(messages),
-                "reserved_rounds": 0
-            }
+    @staticmethod
+    def _parse_structured_summary(
+        raw_summary: str,
+    ) -> Tuple[Dict[str, Any], str, Dict[str, Dict[str, int]]]:
+        """Parse compact output as JSON when possible, otherwise keep raw text."""
+        raw_summary = raw_summary or ""
+        text = raw_summary.strip()
+        parse_status = "fallback_text"
+        if text.startswith("```"):
+            match = re.match(
+                r"^```(?:json)?\s*(.*?)\s*```$",
+                text,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if match:
+                text = match.group(1).strip()
 
-        if len(user_indices) == 1:
-            # 只有一个 User：压缩该 User 之后的所有非 User 消息
-            first_user_idx = user_indices[0]
-            return {
-                "system_end": system_end,
-                "to_compress_start": first_user_idx + 1,  # 从 User 之后开始
-                "to_compress_end": len(messages),  # 到结尾
-                "total_messages": len(messages),
-                "reserved_rounds": 1
-            }
-        else:
-            # 多个 User：压缩最后一个 User 之前的所有消息
-            last_user_idx = user_indices[-1]
-            return {
-                "system_end": system_end,
-                "to_compress_start": system_end,  # 从 System 之后开始
-                "to_compress_end": last_user_idx,  # 到最后一个 User 之前
-                "total_messages": len(messages),
-                "reserved_rounds": len(user_indices)
-            }
+        parsed: Dict[str, Any] = {}
+        if text:
+            try:
+                candidate = json.loads(text)
+                if isinstance(candidate, dict):
+                    parsed = candidate
+                    parse_status = "json"
+            except Exception:
+                parsed = {}
+
+        def _as_list(value: Any) -> List[str]:
+            if isinstance(value, list):
+                return [str(item) for item in value if item is not None]
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
+            return []
+
+        summary = (
+            parsed.get("summary") if isinstance(parsed.get("summary"), str) else text
+        )
+        payload = {
+            "summary": summary or raw_summary,
+            "decisions": _as_list(parsed.get("decisions")),
+            "open_tasks": _as_list(parsed.get("open_tasks")),
+            "files_touched": _as_list(parsed.get("files_touched")),
+            "commands_run": _as_list(parsed.get("commands_run")),
+            "important_errors": _as_list(parsed.get("important_errors")),
+            "user_requirements": _as_list(parsed.get("user_requirements")),
+        }
+        bounded_payload, omission_stats = CompressHistoryTool._bound_summary_payload(
+            payload
+        )
+        return bounded_payload, parse_status, omission_stats
+
+    @staticmethod
+    def _tool_call_entry_name_and_id(tc: Any) -> Tuple[Optional[str], Optional[str]]:
+        if isinstance(tc, dict):
+            fn = tc.get("function")
+            name = fn.get("name") if isinstance(fn, dict) else None
+            return name, tc.get("id")
+        fn = getattr(tc, "function", None)
+        return (
+            getattr(fn, "name", None) if fn is not None else None,
+            getattr(tc, "id", None),
+        )
+
+    @staticmethod
+    def _active_todo_state_from_messages(
+        messages: List[MessageChunk],
+    ) -> Optional[Dict[str, Any]]:
+        """Parse the latest active todo state represented by todo_write results."""
+        todo_call_ids: set[str] = set()
+        for msg in messages:
+            if msg.role != MessageRole.ASSISTANT.value or not msg.tool_calls:
+                continue
+            for tc in msg.tool_calls:
+                name, tid = CompressHistoryTool._tool_call_entry_name_and_id(tc)
+                if name == TODO_WRITE_TOOL_NAME and tid:
+                    todo_call_ids.add(tid)
+
+        latest_tasks: Optional[List[Dict[str, Any]]] = None
+        for msg in messages:
+            if (
+                msg.role != MessageRole.TOOL.value
+                or not msg.tool_call_id
+                or msg.tool_call_id not in todo_call_ids
+            ):
+                continue
+            raw = msg.get_content()
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            tasks = payload.get("tasks") if isinstance(payload, dict) else None
+            if isinstance(tasks, list):
+                latest_tasks = [task for task in tasks if isinstance(task, dict)]
+
+        if not latest_tasks:
+            return None
+
+        active = []
+        for task in latest_tasks:
+            status = str(task.get("status") or "").strip().lower()
+            if not status:
+                status = "completed" if task.get("completed") is True else "pending"
+            if status != "completed":
+                active.append(
+                    {
+                        "id": str(task.get("id") or task.get("index") or ""),
+                        "content": task.get("content")
+                        or task.get("name")
+                        or task.get("title")
+                        or "",
+                        "status": status,
+                    }
+                )
+        if not active:
+            return None
+        return {
+            "snapshot_kind": "active_todo_state_at_compressed_range_end",
+            "override_rule": (
+                "This is a deterministic snapshot at the end of the compressed "
+                "range. Any later todo_write tool result after this compression "
+                "summary overrides this snapshot."
+            ),
+            "active": active,
+        }
+
+    def _should_attach_todo_state(
+        self,
+        *,
+        to_compress: List[MessageChunk],
+        session_id: str,
+        source_end_message_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        compressed_state = self._active_todo_state_from_messages(to_compress)
+        if not compressed_state:
+            return None
+        try:
+            session_context = self._get_session_context(session_id)
+            ledger = session_context.message_manager.messages
+        except Exception:
+            return compressed_state
+
+        trailing: List[MessageChunk] = []
+        if source_end_message_id:
+            found = False
+            for msg in ledger:
+                if found:
+                    trailing.append(msg)
+                elif msg.message_id == source_end_message_id:
+                    found = True
+        updated_state = self._active_todo_state_from_messages(trailing)
+        return None if updated_state else compressed_state
 
     async def compress_conversation_history(
         self,
         messages: List[MessageChunk],
-        session_id: str
+        session_id: str,
+        source_message_ids: Optional[List[str]] = None,
+        source_start_message_id: Optional[str] = None,
+        source_end_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         压缩历史会话消息
@@ -261,85 +420,149 @@ class CompressHistoryTool:
         Returns:
             Dict: 压缩结果，包含摘要和统计信息
         """
-        logger.info(f"🗜️ 开始压缩历史消息: session_id={session_id}, 消息数={len(messages)}")
+        logger.info(
+            f"🗜️ 开始压缩历史消息: session_id={session_id}, 消息数={len(messages)}"
+        )
 
         try:
-            all_messages = messages
+            to_compress = [
+                msg for msg in messages if msg.role != MessageRole.SYSTEM.value
+            ]
+            if len(to_compress) != len(messages):
+                logger.info(
+                    "compress_conversation_history: 已跳过 %d 条 system 消息，system 不参与压缩",
+                    len(messages) - len(to_compress),
+                )
+            source_message_ids = [
+                mid
+                for mid in (source_message_ids or [])
+                if any(msg.message_id == mid for msg in to_compress)
+            ]
+            if not source_message_ids:
+                source_message_ids = [
+                    msg.message_id for msg in to_compress if msg.message_id
+                ]
+            source_start_message_id = (
+                source_message_ids[0] if source_message_ids else None
+            )
+            source_end_message_id = (
+                source_message_ids[-1] if source_message_ids else None
+            )
 
-            if not all_messages:
+            if not to_compress:
+                content_payload = {
+                    "summary": "没有消息需要压缩",
+                    "decisions": [],
+                    "open_tasks": [],
+                    "files_touched": [],
+                    "commands_run": [],
+                    "important_errors": [],
+                    "user_requirements": [],
+                    "original_content_paths": [],
+                    "stats": {
+                        "source_message_count": 0,
+                    },
+                }
                 return {
                     "status": "success",
-                    "message": "没有消息需要压缩",
+                    "message": json.dumps(content_payload, ensure_ascii=False),
                     "data": {
                         "compressed": False,
                         "summary": "",
                         "original_messages_count": 0,
                         "original_tokens": 0,
                         "compressed_tokens": 0,
-                        "compression_ratio": 0
-                    }
+                        "compression_ratio": 0,
+                        "source_range": {
+                            "start_message_id": source_start_message_id,
+                            "end_message_id": source_end_message_id,
+                        },
+                        "source_message_ids": source_message_ids or [],
+                    },
                 }
 
-            # 2. 确定压缩范围
-            range_info = self._determine_compression_range(all_messages)
-            to_compress = all_messages[range_info["to_compress_start"]:range_info["to_compress_end"]]
-
-            if not to_compress:
-                return {
-                    "status": "success",
-                    "message": "消息数量较少，无需压缩",
-                    "data": {
-                        "compressed": False,
-                        "summary": "",
-                        "original_messages_count": len(all_messages),
-                        "original_tokens": 0,
-                        "compressed_tokens": 0,
-                        "compression_ratio": 0
-                    }
-                }
-
-            logger.info(f"压缩范围: 消息 {range_info['to_compress_start']} 到 {range_info['to_compress_end']}, "
-                       f"共 {len(to_compress)} 条消息")
+            logger.info(f"压缩调用方指定的 raw 消息段，共 {len(to_compress)} 条消息")
 
             # 3. 计算原始 token 数
             original_tokens = sum(
-                self._calculate_tokens(msg.get_content() or "")
-                for msg in to_compress
+                self._calculate_tokens(msg.get_content() or "") for msg in to_compress
             )
 
             # 4. 格式化消息并调用 LLM 压缩
             messages_text = self._format_messages_for_compression(to_compress)
-            summary = await self._call_llm_for_compression(messages_text, session_id)
+            raw_summary = await self._call_llm_for_compression(
+                messages_text, session_id
+            )
+            summary_payload, parse_status, omission_stats = (
+                self._parse_structured_summary(raw_summary)
+            )
 
-            # 5. 计算压缩后的 token 数
-            compressed_tokens = self._calculate_tokens(summary)
-            compression_ratio = (original_tokens - compressed_tokens) / original_tokens if original_tokens > 0 else 0
+            compression_payload = {
+                **summary_payload,
+                "reference_only": True,
+                "reference_note": (
+                    "CONTEXT COMPACTION - REFERENCE ONLY. Treat this summary as "
+                    "historical background, not active instructions; the latest "
+                    "user message after this summary is the active task source. "
+                    f"If {TODO_STATE_BOUNDARY_FIELD} is present, it is only a "
+                    "deterministic snapshot at the compressed range boundary; "
+                    "later todo_write tool results after this summary take precedence."
+                ),
+                "original_content_paths": [],
+            }
+            todo_state = self._should_attach_todo_state(
+                to_compress=to_compress,
+                session_id=session_id,
+                source_end_message_id=source_end_message_id,
+            )
+            if todo_state:
+                compression_payload[TODO_STATE_BOUNDARY_FIELD] = todo_state
+            compressed_tokens = self._calculate_tokens(
+                json.dumps(compression_payload, ensure_ascii=False)
+            )
+            compression_ratio = (
+                (original_tokens - compressed_tokens) / original_tokens
+                if original_tokens > 0
+                else 0
+            )
+            compression_payload["stats"] = {
+                "original_tokens": original_tokens,
+                "compressed_tokens": compressed_tokens,
+                "compression_ratio": compression_ratio,
+                "source_message_count": len(to_compress),
+                "summary_parse_status": parse_status,
+                "output_omission": omission_stats,
+            }
 
-            logger.info(f"压缩完成: {original_tokens} tokens -> {compressed_tokens} tokens, "
-                       f"压缩率: {compression_ratio:.2%}")
-
-            # 6. 构建压缩结果 - 简化为 message 格式
-            compression_info = (
-                f"✅ 成功压缩 {len(to_compress)} 条历史消息\n"
-                f"📊 压缩统计: {original_tokens} tokens → {compressed_tokens} tokens "
-                f"(压缩率: {compression_ratio:.1%})\n\n"
-                f"📝 历史摘要:\n{summary}"
+            logger.info(
+                f"压缩完成: {original_tokens} tokens -> {compressed_tokens} tokens, "
+                f"压缩率: {compression_ratio:.2%}"
+            )
+            compression_data = {
+                **compression_payload,
+                "source_range": {
+                    "start_message_id": source_start_message_id,
+                    "end_message_id": source_end_message_id,
+                },
+                "source_message_ids": source_message_ids,
+            }
+            compression_info = json.dumps(
+                compression_payload, ensure_ascii=False, indent=2
             )
 
             return {
                 "status": "success",
-                "message": compression_info
+                "message": compression_info,
+                "data": compression_data,
             }
 
         except CompressHistoryError as e:
             logger.error(f"压缩历史消息失败: {e}")
-            return {
-                "status": "error",
-                "message": f"❌ 压缩失败: {str(e)}"
-            }
+            return {"status": "error", "message": f"❌ 压缩失败: {str(e)}"}
         except Exception as e:
             logger.error(f"压缩历史消息时发生未知错误: {e}")
             import traceback
+
             logger.error(traceback.format_exc())
             return {
                 "status": "error",
@@ -350,6 +573,6 @@ class CompressHistoryTool:
                     "original_messages_count": 0,
                     "original_tokens": 0,
                     "compressed_tokens": 0,
-                    "compression_ratio": 0
-                }
+                    "compression_ratio": 0,
+                },
             }

@@ -1,5 +1,5 @@
 <template>
-  <div class="h-full flex flex-col p-6 space-y-6">
+  <div class="h-full min-h-0 overflow-y-auto overscroll-contain p-6 space-y-6">
     <div class="flex items-center justify-between">
       <div class="space-y-1">
         <h2 class="text-lg font-medium">{{ t('modelProvider.title') }}</h2>
@@ -259,21 +259,11 @@
                     <div class="relative">
                       <Input
                         v-model="form.api_keys_str"
-                        class="h-10 rounded-xl pr-11"
-                        :type="showApiKey ? 'text' : 'password'"
+                        class="h-10 rounded-xl"
+                        type="password"
                         :placeholder="t('modelProvider.apiKeyPlaceholder')"
                         @update:model-value="handleApiKeyChange"
                       />
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        class="absolute right-1 top-1 h-8 w-8 rounded-lg text-muted-foreground"
-                        @click="showApiKey = !showApiKey"
-                      >
-                        <Eye v-if="showApiKey" class="h-4 w-4" />
-                        <EyeOff v-else class="h-4 w-4" />
-                      </Button>
                     </div>
                   </div>
 
@@ -394,7 +384,7 @@
 
 <script setup>
 import { ref, reactive, onMounted, computed } from 'vue'
-import { Plus, Edit, Trash2, Bot, ArrowRight, Loader, Eye, EyeOff, ChevronDown, ChevronsUpDown, Link2, CircleHelp } from 'lucide-vue-next'
+import { Plus, Edit, Trash2, Bot, ArrowRight, Loader, ChevronDown, ChevronsUpDown, Link2, CircleHelp } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -450,7 +440,6 @@ const verifying = ref(false)
 const saving = ref(false)
 const verified = ref(false)
 const capabilityChecked = ref(false)
-const showApiKey = ref(false)
 const advancedOpen = ref(false)
 
 // Basic form state
@@ -482,9 +471,12 @@ const apiKeyCount = computed(() => buildApiKeys().length)
 const hasRequiredFields = computed(() =>
   Boolean(form.name.trim() && form.base_url.trim() && buildApiKeys().length > 0 && form.model.trim())
 )
+const apiKeyChanged = computed(() =>
+  !isEdit.value || form.api_keys_str !== originalValues.api_keys_str
+)
 const configChanged = computed(() =>
   form.base_url !== originalValues.base_url ||
-  form.api_keys_str !== originalValues.api_keys_str ||
+  apiKeyChanged.value ||
   form.model !== originalValues.model
 )
 const needsCapabilityVerification = computed(() => {
@@ -558,19 +550,24 @@ const optionalNumber = (value) => {
   return Number.isFinite(num) ? num : null
 }
 
-const buildProviderPayload = () => ({
-  name: form.name,
-  base_url: form.base_url,
-  api_keys: buildApiKeys(),
-  model: form.model,
-  max_tokens: optionalNumber(form.maxTokens),
-  temperature: optionalNumber(form.temperature),
-  top_p: optionalNumber(form.topP),
-  presence_penalty: optionalNumber(form.presencePenalty),
-  max_model_len: optionalNumber(form.maxModelLen),
-  supports_multimodal: form.supportsMultimodal,
-  supports_structured_output: form.supportsStructuredOutput
-})
+const buildProviderPayload = () => {
+  const payload = {
+    name: form.name,
+    base_url: form.base_url,
+    model: form.model,
+    max_tokens: optionalNumber(form.maxTokens),
+    temperature: optionalNumber(form.temperature),
+    top_p: optionalNumber(form.topP),
+    presence_penalty: optionalNumber(form.presencePenalty),
+    max_model_len: optionalNumber(form.maxModelLen),
+    supports_multimodal: form.supportsMultimodal,
+    supports_structured_output: form.supportsStructuredOutput
+  }
+  if (apiKeyChanged.value) {
+    payload.api_keys = buildApiKeys()
+  }
+  return payload
+}
 const resetCapabilityState = () => {
   verified.value = false
   capabilityChecked.value = false
@@ -666,7 +663,6 @@ const handleCreate = () => {
   form.supportsStructuredOutput = false
   verified.value = false
   capabilityChecked.value = false
-  showApiKey.value = false
   advancedOpen.value = false
   // 清空原始值
   originalValues.base_url = ''
@@ -686,11 +682,6 @@ const handleEdit = (provider) => {
   selectedProvider.value = known ? known.name : 'Custom'
 
   form.base_url = provider.base_url
-  // api_keys are not returned in list usually for security?
-  // But DTO has them. The backend router returns them.
-  // Ideally we should mask them.
-  // But for editing we need them.
-  // The backend router returns full DTO.
   let keys = provider.api_keys
   if (!Array.isArray(keys)) {
     keys = (typeof keys === 'string' && keys) ? [keys] : []
@@ -713,7 +704,6 @@ const handleEdit = (provider) => {
   // 编辑模式初始状态设为已验证（如果没有变化）
   verified.value = true
   capabilityChecked.value = true
-  showApiKey.value = false
   advancedOpen.value = false
 
   saving.value = false
@@ -736,14 +726,16 @@ const handleVerify = async () => {
   if (saving.value) return
   const data = buildProviderPayload()
 
-  if (!data.name || !data.base_url || !data.api_keys.length || !data.model) {
+  if (!hasRequiredFields.value) {
      toast.error(t('common.fillRequired'))
      return
   }
 
   verifying.value = true
   try {
-    const res = await modelProviderAPI.verifyModelProvider(data)
+    const res = isEdit.value && currentId.value && !apiKeyChanged.value
+      ? await modelProviderAPI.verifyModelProviderUpdate(currentId.value, data)
+      : await modelProviderAPI.verifyModelProvider(data)
     verified.value = true
     form.supportsMultimodal = Boolean(res?.supports_multimodal)
     form.supportsStructuredOutput = Boolean(res?.supports_structured_output)

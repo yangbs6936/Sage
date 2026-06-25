@@ -8,25 +8,18 @@ from app.cli.services.base import mask_api_key as _mask_api_key
 from app.cli.services.base import sanitize_provider_record as _sanitize_provider_record
 from app.cli.services.base import trim_optional_text as _trim_optional_text
 from app.cli.services.doctor import _collect_memory_runtime_diagnostics
-from app.cli.services.doctor import (
-    build_minimal_cli_env_template,
-    collect_config_info,
-    collect_doctor_info,
-    probe_default_provider,
-    write_cli_config_file,
-)
+from app.cli.services.doctor import probe_default_provider, write_cli_config_file
 from app.cli.services.provider import (
     _build_provider_update_data,
-    _resolve_provider_create_data,
     create_cli_provider,
     delete_cli_provider,
     inspect_cli_provider,
     list_cli_providers,
-    query_cli_providers,
     update_cli_provider,
     verify_cli_provider,
 )
 from app.cli.services.runtime import (
+    AGENT_CONFIG_PRESETS as AGENT_CONFIG_PRESETS,
     collect_runtime_issues as _collect_runtime_issues,
     cli_db_runtime,
     cli_runtime,
@@ -35,7 +28,14 @@ from app.cli.services.runtime import (
     get_default_cli_max_loop_count,
     get_default_cli_user_id,
     init_cli_config,
+    is_bundled_coding_agent_config as is_bundled_coding_agent_config,
+    load_agent_config_file as load_agent_config_file,
+    normalize_sandbox_type as normalize_sandbox_type,
+    resolve_agent_config_path as resolve_agent_config_path,
     run_request_stream,
+    validate_agent_config_workspace as validate_agent_config_workspace,
+    validate_agent_config_workspace_guidance as validate_agent_config_workspace_guidance,
+    validate_agent_selection_options as validate_agent_selection_options,
     validate_cli_request_options,
     validate_cli_runtime_requirements,
     build_run_request,
@@ -54,17 +54,29 @@ def _resolve_provider_create_data_compat(**kwargs):
     from common.schemas.base import LLMProviderCreate
 
     cfg = init_cli_config(init_logging=False)
-    resolved_base_url = _trim_optional_text(kwargs.get("base_url")) or _trim_optional_text(cfg.default_llm_api_base_url)
-    resolved_api_key = _trim_optional_text(kwargs.get("api_key")) or _trim_optional_text(cfg.default_llm_api_key)
-    resolved_model = _trim_optional_text(kwargs.get("model")) or _trim_optional_text(cfg.default_llm_model_name)
+    resolved_base_url = _trim_optional_text(
+        kwargs.get("base_url")
+    ) or _trim_optional_text(cfg.default_llm_api_base_url)
+    resolved_api_key = _trim_optional_text(
+        kwargs.get("api_key")
+    ) or _trim_optional_text(cfg.default_llm_api_key)
+    resolved_model = _trim_optional_text(kwargs.get("model")) or _trim_optional_text(
+        cfg.default_llm_model_name
+    )
 
     next_steps = []
     if not resolved_api_key:
-        next_steps.append("Pass `--api-key`, or set `SAGE_DEFAULT_LLM_API_KEY` in `~/.sage/.sage_env` or local `.env`.")
+        next_steps.append(
+            "Pass `--api-key`, or set `SAGE_DEFAULT_LLM_API_KEY` in `~/.sage/.sage_env` or local `.env`."
+        )
     if not resolved_base_url:
-        next_steps.append("Pass `--base-url`, or set `SAGE_DEFAULT_LLM_API_BASE_URL` in `~/.sage/.sage_env` or local `.env`.")
+        next_steps.append(
+            "Pass `--base-url`, or set `SAGE_DEFAULT_LLM_API_BASE_URL` in `~/.sage/.sage_env` or local `.env`."
+        )
     if not resolved_model:
-        next_steps.append("Pass `--model`, or set `SAGE_DEFAULT_LLM_MODEL_NAME` in `~/.sage/.sage_env` or local `.env`.")
+        next_steps.append(
+            "Pass `--model`, or set `SAGE_DEFAULT_LLM_MODEL_NAME` in `~/.sage/.sage_env` or local `.env`."
+        )
     if next_steps:
         raise CLIError(
             "Provider configuration is incomplete for create/verify.",
@@ -74,9 +86,9 @@ def _resolve_provider_create_data_compat(**kwargs):
     return {
         "data": LLMProviderCreate(
             name=_trim_optional_text(kwargs.get("name")),
-            base_url=resolved_base_url,
-            api_keys=[resolved_api_key],
-            model=resolved_model,
+            base_url=resolved_base_url,  # pyright: ignore[reportArgumentType]
+            api_keys=[resolved_api_key],  # pyright: ignore[reportArgumentType]
+            model=resolved_model,  # pyright: ignore[reportArgumentType]
             max_tokens=kwargs.get("max_tokens"),
             temperature=kwargs.get("temperature"),
             top_p=kwargs.get("top_p"),
@@ -87,8 +99,12 @@ def _resolve_provider_create_data_compat(**kwargs):
             is_default=bool(kwargs.get("is_default")),
         ),
         "sources": {
-            "base_url": "arg" if _trim_optional_text(kwargs.get("base_url")) else "default",
-            "api_key": "arg" if _trim_optional_text(kwargs.get("api_key")) else "default",
+            "base_url": "arg"
+            if _trim_optional_text(kwargs.get("base_url"))
+            else "default",
+            "api_key": "arg"
+            if _trim_optional_text(kwargs.get("api_key"))
+            else "default",
             "model": "arg" if _trim_optional_text(kwargs.get("model")) else "default",
         },
     }
@@ -113,7 +129,9 @@ async def query_cli_providers(
     if default_only:
         providers = [item for item in providers if bool(item.get("is_default"))]
     if normalized_model:
-        providers = [item for item in providers if item.get("model") == normalized_model]
+        providers = [
+            item for item in providers if item.get("model") == normalized_model
+        ]
     if normalized_name_query:
         providers = [
             item
@@ -138,7 +156,9 @@ def collect_doctor_info() -> Dict[str, Any]:
     local_defaults = config.get_local_storage_defaults()
     shared_env_file = local_defaults["env_file"]
     project_env_file = os.path.abspath(".env")
-    effective_env_file = shared_env_file if os.path.exists(shared_env_file) else project_env_file
+    effective_env_file = (
+        shared_env_file if os.path.exists(shared_env_file) else project_env_file
+    )
     env_files = [shared_env_file]
     if os.path.exists(project_env_file):
         env_files.append(project_env_file)
@@ -155,12 +175,15 @@ def collect_doctor_info() -> Dict[str, Any]:
 
     return {
         "status": status,
-        "python": os.environ.get("PYTHON_BIN") or os.environ.get("CONDA_PYTHON_EXE") or "python",
+        "python": os.environ.get("PYTHON_BIN")
+        or os.environ.get("CONDA_PYTHON_EXE")
+        or "python",
         "cwd": os.getcwd(),
         "cwd_writable": os.access(os.getcwd(), os.W_OK),
         "env_file": effective_env_file,
         "env_files": env_files,
-        "env_file_exists": os.path.exists(shared_env_file) or os.path.exists(project_env_file),
+        "env_file_exists": os.path.exists(shared_env_file)
+        or os.path.exists(project_env_file),
         "app_mode": cfg.app_mode,
         "auth_mode": cfg.auth_mode,
         "port": cfg.port,
@@ -188,7 +211,9 @@ def collect_config_info() -> Dict[str, Any]:
     local_defaults = config.get_local_storage_defaults()
     shared_env_file = local_defaults["env_file"]
     project_env_file = os.path.abspath(".env")
-    effective_env_file = shared_env_file if os.path.exists(shared_env_file) else project_env_file
+    effective_env_file = (
+        shared_env_file if os.path.exists(shared_env_file) else project_env_file
+    )
     env_files = [shared_env_file]
     if os.path.exists(project_env_file):
         env_files.append(project_env_file)
@@ -217,13 +242,23 @@ def collect_config_info() -> Dict[str, Any]:
             "SAGE_CLI_USER_ID": os.environ.get("SAGE_CLI_USER_ID"),
             "SAGE_CLI_MAX_LOOP_COUNT": os.environ.get("SAGE_CLI_MAX_LOOP_COUNT"),
             "SAGE_DESKTOP_USER_ID": os.environ.get("SAGE_DESKTOP_USER_ID"),
-            "SAGE_DEFAULT_LLM_API_KEY": "(set)" if os.environ.get("SAGE_DEFAULT_LLM_API_KEY") else None,
-            "SAGE_DEFAULT_LLM_API_BASE_URL": os.environ.get("SAGE_DEFAULT_LLM_API_BASE_URL"),
-            "SAGE_DEFAULT_LLM_MODEL_NAME": os.environ.get("SAGE_DEFAULT_LLM_MODEL_NAME"),
+            "SAGE_DEFAULT_LLM_API_KEY": "(set)"
+            if os.environ.get("SAGE_DEFAULT_LLM_API_KEY")
+            else None,
+            "SAGE_DEFAULT_LLM_API_BASE_URL": os.environ.get(
+                "SAGE_DEFAULT_LLM_API_BASE_URL"
+            ),
+            "SAGE_DEFAULT_LLM_MODEL_NAME": os.environ.get(
+                "SAGE_DEFAULT_LLM_MODEL_NAME"
+            ),
             "SAGE_DB_TYPE": os.environ.get("SAGE_DB_TYPE"),
-            "SAGE_SESSION_MEMORY_BACKEND": os.environ.get("SAGE_SESSION_MEMORY_BACKEND"),
+            "SAGE_SESSION_MEMORY_BACKEND": os.environ.get(
+                "SAGE_SESSION_MEMORY_BACKEND"
+            ),
             "SAGE_FILE_MEMORY_BACKEND": os.environ.get("SAGE_FILE_MEMORY_BACKEND"),
-            "SAGE_SESSION_MEMORY_STRATEGY": os.environ.get("SAGE_SESSION_MEMORY_STRATEGY"),
+            "SAGE_SESSION_MEMORY_STRATEGY": os.environ.get(
+                "SAGE_SESSION_MEMORY_STRATEGY"
+            ),
         },
     }
 
@@ -254,6 +289,7 @@ def build_minimal_cli_env_template() -> str:
         "",
     ]
     return "\n".join(lines)
+
 
 __all__ = [
     "CLIError",

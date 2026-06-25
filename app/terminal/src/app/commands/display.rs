@@ -7,7 +7,7 @@ impl App {
         self.display_mode = mode;
         persist_app_preferences_notice(self);
         self.queue_message(
-            MessageKind::Tool,
+            MessageKind::System,
             format!("display mode set: {}", display_mode_name(mode)),
         );
         self.status = format!("display  {}", self.session_id);
@@ -17,7 +17,7 @@ impl App {
         self.queue_message(
             MessageKind::System,
             format!(
-                "display_mode: {}\nworkspace: {}",
+                "display: {}\nworkspace: {}",
                 display_mode_name(self.display_mode),
                 self.workspace_label
             ),

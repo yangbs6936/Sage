@@ -27,7 +27,9 @@ def _current_goal_payload(
     return None
 
 
-def _print_goal_status(session_summary: Optional[Dict[str, Any]], args: argparse.Namespace) -> None:
+def _print_goal_status(
+    session_summary: Optional[Dict[str, Any]], args: argparse.Namespace
+) -> None:
     goal = _current_goal_payload(session_summary, args)
     if not goal:
         print("goal: (none)")
@@ -45,7 +47,9 @@ def _print_resume_goal_hint(session_summary: Optional[Dict[str, Any]]) -> None:
     objective = str(raw_goal.get("objective") or "").strip()
     if not objective:
         return
-    status = str(raw_goal.get("status") or GOAL_STATUS_ACTIVE).strip() or GOAL_STATUS_ACTIVE
+    status = (
+        str(raw_goal.get("status") or GOAL_STATUS_ACTIVE).strip() or GOAL_STATUS_ACTIVE
+    )
     print(f"continuing goal: {objective} ({status})")
 
 
@@ -59,7 +63,9 @@ def _handle_goal_command(
     if len(parts) >= 3 and parts[1] == "set":
         objective = parts[2].strip()
         if not objective:
-            print("Usage: /goal | /goal <objective> | /goal show | /goal set <objective> | /goal clear | /goal done")
+            print(
+                "Usage: /goal | /goal <objective> | /goal show | /goal set <objective> | /goal clear | /goal done"
+            )
             return None
         args.goal_objective = objective
         args.goal_status = GOAL_STATUS_ACTIVE
@@ -69,7 +75,9 @@ def _handle_goal_command(
     if len(parts) >= 2 and parts[1] not in {"show", "clear", "done"}:
         objective = prompt[len("/goal") :].strip()
         if not objective:
-            print("Usage: /goal | /goal <objective> | /goal show | /goal set <objective> | /goal clear | /goal done")
+            print(
+                "Usage: /goal | /goal <objective> | /goal show | /goal set <objective> | /goal clear | /goal done"
+            )
             return None
         args.goal_objective = objective
         args.goal_status = GOAL_STATUS_ACTIVE
@@ -100,7 +108,9 @@ def _handle_goal_command(
         print(f"goal marked complete: {goal.get('objective')}")
         return None
 
-    print("Usage: /goal | /goal <objective> | /goal show | /goal set <objective> | /goal clear | /goal done")
+    print(
+        "Usage: /goal | /goal <objective> | /goal show | /goal set <objective> | /goal clear | /goal done"
+    )
     return None
 
 
@@ -137,8 +147,39 @@ def _clear_pending_goal_mutation(args: argparse.Namespace) -> None:
     args.clear_goal = False
 
 
+def _prepare_agent_config(args: argparse.Namespace) -> Dict[str, Any]:
+    from app.cli.service import (
+        load_agent_config_file,
+        validate_agent_config_workspace,
+        validate_agent_config_workspace_guidance,
+        validate_agent_selection_options,
+    )
+
+    agent_config_path = getattr(args, "agent_config", None)
+    validate_agent_selection_options(
+        agent_id=getattr(args, "agent_id", None),
+        agent_config=agent_config_path,
+    )
+    validate_agent_config_workspace(
+        agent_config=agent_config_path,
+        workspace=getattr(args, "workspace", None),
+    )
+    if not hasattr(args, "_loaded_agent_config"):
+        args._loaded_agent_config = load_agent_config_file(agent_config_path)
+    validate_agent_config_workspace_guidance(
+        agent_config=args._loaded_agent_config,
+        workspace=getattr(args, "workspace", None),
+    )
+    return args._loaded_agent_config
+
+
 async def build_request(args: argparse.Namespace, task: str):
-    from app.cli.service import build_run_request, validate_requested_skills
+    from app.cli.service import (
+        build_run_request,
+        validate_requested_skills,
+    )
+
+    agent_config = _prepare_agent_config(args)
 
     skills = await validate_requested_skills(
         requested_skills=args.skills,
@@ -165,7 +206,9 @@ async def build_request(args: argparse.Namespace, task: str):
         agent_mode=args.agent_mode,
         available_skills=skills or None,
         max_loop_count=args.max_loop_count,
+        agent_config=agent_config,
         goal=goal,
+        workspace=args.workspace,
     )
 
 
@@ -175,21 +218,32 @@ async def run_command(
     build_request_fn: Callable[[argparse.Namespace, str], Any],
     stream_request_fn: Callable[..., Any],
 ) -> int:
-    from app.cli.service import cli_runtime, validate_cli_request_options, validate_cli_runtime_requirements
+    from app.cli.service import (
+        cli_runtime,
+        validate_cli_request_options,
+        validate_cli_runtime_requirements,
+    )
 
-    validate_cli_runtime_requirements()
     args.workspace = validate_cli_request_options(
         workspace=args.workspace,
         max_loop_count=args.max_loop_count,
+        sandbox_type=getattr(args, "sandbox_type", None),
     )
+    _prepare_agent_config(args)
+    validate_cli_runtime_requirements()
     async with cli_runtime(verbose=args.verbose):
         request = await build_request_fn(args, args.task)
+        stream_kwargs = {
+            "workspace": args.workspace,
+            "command_mode": "run",
+        }
+        if getattr(args, "sandbox_type", None):
+            stream_kwargs["sandbox_type"] = args.sandbox_type
         await stream_request_fn(
             request,
             args.json,
             args.stats,
-            workspace=args.workspace,
-            command_mode="run",
+            **stream_kwargs,
         )
     return 0
 
@@ -213,22 +267,23 @@ async def chat_command(
         validate_cli_runtime_requirements,
     )
 
+    args.workspace = validate_cli_request_options(
+        workspace=args.workspace,
+        max_loop_count=args.max_loop_count,
+        sandbox_type=getattr(args, "sandbox_type", None),
+    )
+    _prepare_agent_config(args)
     session_summary: Optional[Dict[str, Any]] = None
     if not args.session_id:
         args.session_id = str(uuid.uuid4())
 
     if not args.json:
         sys.stderr.write(
-            f"session_id: {args.session_id}\n"
-            "type /help for built-in commands\n"
+            f"session_id: {args.session_id}\ntype /help for built-in commands\n"
         )
         sys.stderr.flush()
 
     validate_cli_runtime_requirements()
-    args.workspace = validate_cli_request_options(
-        workspace=args.workspace,
-        max_loop_count=args.max_loop_count,
-    )
     try:
         async with cli_runtime(verbose=args.verbose):
             if args.session_id:
@@ -279,13 +334,18 @@ async def chat_command(
                     prompt = goal_task
 
                 request = await build_request_fn(args, prompt)
+                stream_kwargs = {
+                    "workspace": args.workspace,
+                    "command_mode": command_mode,
+                    "session_summary": session_summary,
+                }
+                if getattr(args, "sandbox_type", None):
+                    stream_kwargs["sandbox_type"] = args.sandbox_type
                 await stream_request_fn(
                     request,
                     args.json,
                     args.stats,
-                    workspace=args.workspace,
-                    command_mode=command_mode,
-                    session_summary=session_summary,
+                    **stream_kwargs,
                 )
                 session_summary = _apply_goal_mutation_to_summary(session_summary, args)
                 _clear_pending_goal_mutation(args)

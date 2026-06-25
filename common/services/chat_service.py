@@ -54,8 +54,8 @@ def _is_desktop_mode() -> bool:
     return _get_cfg().app_mode == "desktop"
 
 
-def _chat_exception(detail: str) -> SageHTTPException:
-    kwargs: Dict[str, Any] = {"detail": detail}
+def _chat_exception(message_key: str) -> SageHTTPException:
+    kwargs: Dict[str, Any] = {"message_key": message_key}
     if _is_desktop_mode():
         kwargs["status_code"] = 500
     return SageHTTPException(**kwargs)
@@ -144,7 +144,10 @@ async def _resolve_input_optimization_model_client(
     agent_id: str = "",
     user_id: str = "",
 ) -> Tuple[Any, str]:
-    from common.services.agent_service import _resolve_model_client, _create_model_client
+    from common.services.agent_service import (
+        _resolve_model_client,
+        _create_model_client,
+    )
 
     resolved_agent_id = agent_id or ""
     if not resolved_agent_id and session_id:
@@ -155,7 +158,11 @@ async def _resolve_input_optimization_model_client(
     if resolved_agent_id:
         agent = await AgentConfigDao().get_by_id(resolved_agent_id)
         agent_config = agent.config if agent and agent.config else {}
-        provider_id = agent_config.get("llm_provider_id") if isinstance(agent_config, dict) else None
+        provider_id = (
+            agent_config.get("llm_provider_id")
+            if isinstance(agent_config, dict)
+            else None
+        )
         if provider_id:
             provider = await LLMProviderDao().get_by_id(provider_id)
             if provider:
@@ -205,8 +212,13 @@ async def optimize_user_input(
             return result
 
         error_message = (result or {}).get("error_message", "") or ""
-        is_invalid_api_key = "INVALID_API_KEY" in error_message or "AuthenticationError" == (result or {}).get("error_type")
-        if not (_is_desktop_mode() and is_invalid_api_key and attempt < max_attempts - 1):
+        is_invalid_api_key = (
+            "INVALID_API_KEY" in error_message
+            or "AuthenticationError" == (result or {}).get("error_type")
+        )
+        if not (
+            _is_desktop_mode() and is_invalid_api_key and attempt < max_attempts - 1
+        ):
             break
 
         logger.warning(
@@ -215,7 +227,9 @@ async def optimize_user_input(
 
     optimized_input = (result or {}).get("optimized_input", "").strip()
     if not optimized_input:
-        raise SageHTTPException(detail="用户输入优化失败", error_detail="优化结果为空")
+        raise SageHTTPException(
+            message_key="chat.input_optimization_failed", error_detail="优化结果为空"
+        )
 
     if result.get("status") == "fallback":
         logger.warning(
@@ -282,7 +296,9 @@ async def optimize_user_input_stream(
                     "timestamp": time.time(),
                 }
                 total_cost = time.perf_counter() - overall_start
-                logger.info(f"流式优化用户输入成功，attempt={attempt + 1}, total_cost={total_cost:.3f}s")
+                logger.info(
+                    f"流式优化用户输入成功，attempt={attempt + 1}, total_cost={total_cost:.3f}s"
+                )
                 return
 
             fallback_result = optimizer._fallback_result(current_input)
@@ -290,7 +306,10 @@ async def optimize_user_input_stream(
         except Exception as exc:
             error_message = str(exc)
             error_type = type(exc).__name__
-            is_invalid_api_key = "INVALID_API_KEY" in error_message or error_type == "AuthenticationError"
+            is_invalid_api_key = (
+                "INVALID_API_KEY" in error_message
+                or error_type == "AuthenticationError"
+            )
             if _is_desktop_mode() and is_invalid_api_key and attempt < max_attempts - 1:
                 logger.warning(
                     f"流式优化用户输入命中无效 API Key，准备重试下一组客户端，attempt={attempt + 1}/{max_attempts}"
@@ -372,8 +391,10 @@ def _copy_docs_to_agent_workspace(agent_workspace: str) -> None:
         if docs_dir is None:
             # PyInstaller 运行时，sys._MEIPASS 指向临时解压目录
             import sys
-            if hasattr(sys, '_MEIPASS'):
-                possible_docs = Path(sys._MEIPASS) / "docs"
+
+            meipass_dir = getattr(sys, "_MEIPASS", None)
+            if meipass_dir:
+                possible_docs = Path(meipass_dir) / "docs"
                 if possible_docs.exists() and possible_docs.is_dir():
                     docs_dir = possible_docs
                     logger.debug(f"从 PyInstaller 目录找到 docs: {docs_dir}")
@@ -381,6 +402,7 @@ def _copy_docs_to_agent_workspace(agent_workspace: str) -> None:
         # 3. 包安装目录（pip install 生产环境 - 旧方式）
         if docs_dir is None:
             import sagents
+
             package_dir = Path(sagents.__file__).parent.parent
             possible_docs = package_dir / "docs"
             if possible_docs.exists() and possible_docs.is_dir():
@@ -391,6 +413,7 @@ def _copy_docs_to_agent_workspace(agent_workspace: str) -> None:
         # data_files 会安装到 sys.prefix/share/sage/docs 或 /usr/local/share/sage/docs
         if docs_dir is None:
             import sys
+
             possible_paths = [
                 Path(sys.prefix) / "share" / "sage" / "docs",
                 Path("/usr") / "local" / "share" / "sage" / "docs",
@@ -405,6 +428,7 @@ def _copy_docs_to_agent_workspace(agent_workspace: str) -> None:
         # 5. 系统 site-packages 目录
         if docs_dir is None:
             import site
+
             for site_dir in site.getsitepackages():
                 possible_docs = Path(site_dir) / "docs"
                 if possible_docs.exists() and possible_docs.is_dir():
@@ -485,7 +509,7 @@ async def _copy_sage_usage_docs_to_agent_workspace(
 
 
 async def _register_extra_mcp_tools(request: StreamRequest) -> None:
-    extra_mcp_config = request.extra_mcp_config or request.system_context.get(
+    extra_mcp_config = request.extra_mcp_config or request.system_context.get(  # pyright: ignore[reportOptionalMemberAccess]
         "extra_mcp_config", None
     )
     if not extra_mcp_config:
@@ -508,9 +532,12 @@ async def _register_extra_mcp_tools(request: StreamRequest) -> None:
             value["disabled"] = False
 
         if not any(
-            field in value for field in ["command", "sse_url", "url", "streamable_http_url"]
+            field in value
+            for field in ["command", "sse_url", "url", "streamable_http_url"]
         ):
-            logger.warning(f"Invalid MCP config for {key}: missing connection parameters")
+            logger.warning(
+                f"Invalid MCP config for {key}: missing connection parameters"
+            )
             continue
 
         from common.utils.mcp_anytool_url import coalesce_anytool_streamable_url
@@ -520,8 +547,8 @@ async def _register_extra_mcp_tools(request: StreamRequest) -> None:
         if not registered_tools:
             logger.warning(f"Failed to register MCP server {key} with tools")
 
-    if "extra_mcp_config" in request.system_context:
-        del request.system_context["extra_mcp_config"]
+    if "extra_mcp_config" in request.system_context:  # pyright: ignore[reportOperatorIssue]
+        del request.system_context["extra_mcp_config"]  # pyright: ignore[reportOptionalSubscript]
 
 
 def _inject_skill_tools(request: StreamRequest) -> None:
@@ -589,18 +616,22 @@ async def _populate_custom_sub_agents(request: StreamRequest) -> None:
 
     sub_agent_dao = AgentConfigDao()
     sub_agents = await sub_agent_dao.get_by_ids(deduped_ids)
-    request.custom_sub_agents = [
-        CustomSubAgentConfig(
-            agent_id=sub_agent.agent_id,
-            name=sub_agent.name,
-            description=sub_agent.config.get("description", ""),
-            available_workflows=sub_agent.config.get("availableWorkflows", {}),
-            system_context=sub_agent.config.get("systemContext", {}),
-            available_tools=sub_agent.config.get("availableTools", []),
-            available_skills=sub_agent.config.get("availableSkills", []),
+    custom_sub_agents: List[CustomSubAgentConfig] = []
+    for sub_agent in sub_agents:
+        system_context = dict(sub_agent.config.get("systemContext", {}) or {})
+        custom_sub_agents.append(
+            CustomSubAgentConfig(
+                agent_id=sub_agent.agent_id,
+                name=sub_agent.name,
+                description=sub_agent.config.get("description", ""),
+                available_workflows=sub_agent.config.get("availableWorkflows", {}),
+                system_context=system_context,
+                available_tools=sub_agent.config.get("availableTools", []),
+                available_skills=sub_agent.config.get("availableSkills", []),
+                agent_mode=sub_agent.config.get("agentMode"),
+            )
         )
-        for sub_agent in sub_agents
-    ]
+    request.custom_sub_agents = custom_sub_agents
 
 
 async def populate_request_from_agent_config(
@@ -611,12 +642,12 @@ async def populate_request_from_agent_config(
     agent = None
     if request.agent_id is None:
         if require_agent_id:
-            raise _chat_exception("Agent ID 不能为空")
+            raise _chat_exception("chat.agent_id_required")
     else:
         agent = await AgentConfigDao().get_by_id(request.agent_id)
         if not agent or not agent.config:
             if require_agent_id:
-                raise _chat_exception("Agent 不存在")
+                raise _chat_exception("chat.agent_not_found")
             logger.warning(f"Agent {request.agent_id} not found")
             agent = None
         else:
@@ -635,7 +666,10 @@ async def populate_request_from_agent_config(
             request.available_skills = agent_config.get("availableSkills")
         if agent_config.get("availableWorkflows") is not None:
             request.available_workflows = agent_config.get("availableWorkflows")
-        if agent_config.get("maxLoopCount") is not None and request.max_loop_count is None:
+        if (
+            agent_config.get("maxLoopCount") is not None
+            and request.max_loop_count is None
+        ):
             request.max_loop_count = agent_config.get("maxLoopCount")
         if agent_config.get("agentMode") is not None and request.agent_mode is None:
             request.agent_mode = agent_config.get("agentMode")
@@ -643,34 +677,47 @@ async def populate_request_from_agent_config(
             request.more_suggest = agent_config.get("moreSuggest")
         if agent_config.get("systemContext") is not None:
             agent_system_context = agent_config.get("systemContext")
-            _merge_dict(request, "system_context", agent_system_context)
+            _merge_dict(request, "system_context", agent_system_context)  # pyright: ignore[reportArgumentType]
             if (
                 isinstance(agent_system_context, dict)
                 and agent_system_context.get("response_language") is not None
             ):
                 if request.system_context is None:
                     request.system_context = {}
-                request.system_context["response_language"] = agent_system_context["response_language"]
+                request.system_context["response_language"] = agent_system_context[
+                    "response_language"
+                ]
         if agent_config.get("systemPrefix") is not None:
             request.system_prefix = agent_config.get("systemPrefix")
         if agent_config.get("memoryType") is not None:
             request.memory_type = agent_config.get("memoryType")
         if agent_config.get("availableKnowledgeBases") is not None:
-            request.available_knowledge_bases = agent_config.get("availableKnowledgeBases")
-        if agent_config.get("availableSubAgentIds") is not None and request.available_sub_agent_ids is None:
+            request.available_knowledge_bases = agent_config.get(
+                "availableKnowledgeBases"
+            )
+        if (
+            agent_config.get("availableSubAgentIds") is not None
+            and request.available_sub_agent_ids is None
+        ):
             request.available_sub_agent_ids = agent_config.get("availableSubAgentIds")
 
         # auto_all: when subAgentSelectionMode is "auto_all" (or defaults to it),
         # auto-populate available_sub_agent_ids with all agents (excluding self)
-        if request.agent_mode == "fibre" and not request.available_sub_agent_ids:
-            selection_mode = agent_config.get("subAgentSelectionMode") or agent_config.get("sub_agent_selection_mode")
+        if (
+            request.agent_mode in {"fibre", "team"}
+            and request.available_sub_agent_ids is None
+        ):
+            selection_mode = agent_config.get(
+                "subAgentSelectionMode"
+            ) or agent_config.get("sub_agent_selection_mode")
             configured_ids = agent_config.get("availableSubAgentIds")
             if selection_mode is None:
                 selection_mode = "manual" if configured_ids else "auto_all"
             if selection_mode == "auto_all":
                 all_agents = await AgentConfigDao().get_all()
                 request.available_sub_agent_ids = [
-                    a.agent_id for a in all_agents
+                    a.agent_id
+                    for a in all_agents
                     if a.agent_id and a.agent_id != request.agent_id
                 ]
 
@@ -681,9 +728,14 @@ async def populate_request_from_agent_config(
         request.llm_model_config = {}
 
     provider_dao = LLMProviderDao()
-    provider_id = agent_config.get("llm_provider_id") if agent_config else None
+    request_provider_id = str(getattr(request, "provider_id", "") or "").strip()
+    provider_id = request_provider_id or (
+        agent_config.get("llm_provider_id") if agent_config else None
+    )
     if provider_id:
         provider = await provider_dao.get_by_id(provider_id)
+        if provider is None:
+            raise ValueError(f"LLM provider not found: {provider_id}")
         request.llm_model_config["base_url"] = provider.base_url
         request.llm_model_config["api_key"] = _get_provider_api_key(provider)
         request.llm_model_config["model"] = provider.model
@@ -694,16 +746,23 @@ async def populate_request_from_agent_config(
         request.llm_model_config["presence_penalty"] = provider.presence_penalty
         request.llm_model_config["max_model_len"] = provider.max_model_len
         request.llm_model_config["supports_multimodal"] = provider.supports_multimodal
-        request.llm_model_config["supports_structured_output"] = provider.supports_structured_output
+        request.llm_model_config["supports_structured_output"] = (
+            provider.supports_structured_output
+        )
     else:
         provider = await provider_dao.get_default()
+        if provider is None:
+            raise ValueError("Default LLM provider not found")
         if request.llm_model_config.get("base_url") is None:
             request.llm_model_config["base_url"] = provider.base_url
         if request.llm_model_config.get("api_key") is None:
             request.llm_model_config["api_key"] = _get_provider_api_key(provider)
         if request.llm_model_config.get("model") is None:
             request.llm_model_config["model"] = provider.model
-        if request.llm_model_config.get("max_tokens") is None and provider.max_tokens is not None:
+        if (
+            request.llm_model_config.get("max_tokens") is None
+            and provider.max_tokens is not None
+        ):
             request.llm_model_config["max_tokens"] = provider.max_tokens
         if request.llm_model_config.get("temperature") is None:
             request.llm_model_config["temperature"] = provider.temperature
@@ -714,16 +773,27 @@ async def populate_request_from_agent_config(
         if request.llm_model_config.get("max_model_len") is None:
             request.llm_model_config["max_model_len"] = provider.max_model_len
         if request.llm_model_config.get("supports_multimodal") is None:
-            request.llm_model_config["supports_multimodal"] = provider.supports_multimodal
+            request.llm_model_config["supports_multimodal"] = (
+                provider.supports_multimodal
+            )
         if request.llm_model_config.get("supports_structured_output") is None:
-            request.llm_model_config["supports_structured_output"] = provider.supports_structured_output
+            request.llm_model_config["supports_structured_output"] = (
+                provider.supports_structured_output
+            )
 
     # 处理快速模型配置
-    fast_provider_id = agent_config.get("fast_llm_provider_id") if agent_config else None
+    request_fast_provider_id = str(
+        getattr(request, "fast_provider_id", "") or ""
+    ).strip()
+    fast_provider_id = request_fast_provider_id or (
+        agent_config.get("fast_llm_provider_id") if agent_config else None
+    )
     if fast_provider_id:
         fast_provider = await provider_dao.get_by_id(fast_provider_id)
         if fast_provider:
-            request.llm_model_config["fast_api_key"] = _get_provider_api_key(fast_provider)
+            request.llm_model_config["fast_api_key"] = _get_provider_api_key(
+                fast_provider
+            )
             request.llm_model_config["fast_base_url"] = fast_provider.base_url
             request.llm_model_config["fast_model_name"] = fast_provider.model
             logger.info(f"Fast model configured: {fast_provider.model}")
@@ -731,7 +801,7 @@ async def populate_request_from_agent_config(
     if request.max_loop_count is None:
         raise SageHTTPException(
             status_code=400,
-            detail="max_loop_count 必须显式传入",
+            message_key="chat.max_loop_required",
             error_detail="Missing required field: max_loop_count",
         )
 
@@ -756,12 +826,16 @@ async def populate_request_from_agent_config(
     if _is_desktop_mode():
         try:
             all_im_configs = await IMChannelConfigDao().get_all_configs()
-            im_enabled = any(config.get("enabled", False) for config in all_im_configs.values())
-            if im_enabled and "send_message_through_im" not in request.available_tools:
-                request.available_tools = list(request.available_tools) + [
+            im_enabled = any(
+                config.get("enabled", False) for config in all_im_configs.values()
+            )
+            if im_enabled and "send_message_through_im" not in request.available_tools:  # pyright: ignore[reportOperatorIssue]
+                request.available_tools = list(request.available_tools) + [  # pyright: ignore[reportArgumentType]
                     "send_message_through_im"
                 ]
-                logger.info("[Chat] Added send_message_through_im tool (IM provider enabled)")
+                logger.info(
+                    "[Chat] Added send_message_through_im tool (IM provider enabled)"
+                )
         except Exception as e:
             logger.warning(f"[Chat] Failed to check IM config: {e}")
     else:
@@ -788,8 +862,8 @@ async def populate_request_from_agent_config(
         kdb_dao = KdbDao()
         kdbs, _ = await kdb_dao.get_kdbs_paginated(
             kdb_ids=request.available_knowledge_bases,
-            data_type=None,
-            query_name=None,
+            data_type=None,  # pyright: ignore[reportArgumentType]
+            query_name=None,  # pyright: ignore[reportArgumentType]
             page=1,
             page_size=1000,
         )
@@ -798,8 +872,8 @@ async def populate_request_from_agent_config(
                 f"{kdb.name}数据库的index_name": kdb.get_index_name() for kdb in kdbs
             }
             _merge_dict(request, "system_context", kdb_context)
-            if "retrieve_on_zavixai_db" not in request.available_tools:
-                request.available_tools.append("retrieve_on_zavixai_db")
+            if "retrieve_on_zavixai_db" not in request.available_tools:  # pyright: ignore[reportOperatorIssue]
+                request.available_tools.append("retrieve_on_zavixai_db")  # pyright: ignore[reportOptionalMemberAccess]
 
     _inject_skill_tools(request)
     _strip_skill_tools_when_unavailable(request)
@@ -817,8 +891,7 @@ class SageStreamService:
         # Server runtime workspaces are caller-scoped ("who uses it, owns the run files"),
         # while skills still resolve from the Agent owner.
         self.skill_owner_user_id = (
-            self.request.agent_owner_user_id
-            or self.runtime_user_id
+            self.request.agent_owner_user_id or self.runtime_user_id
         )
         self.runtime_agent_id = self.request.agent_id or "".join(
             random.choices(string.ascii_letters, k=8)
@@ -846,13 +919,33 @@ class SageStreamService:
             self.agent_workspace_root = workspace_root
             self.agent_workspace = str(self.agent_workspace_root)
 
-        self.tool_manager = create_tool_proxy(request.available_tools)
+        self.tool_manager = create_tool_proxy(request.available_tools)  # pyright: ignore[reportArgumentType]
+        if isinstance(request.system_context, dict) and request.system_context.get(
+            "team_workspace_mode"
+        ):
+            from sagents.agent.team.tools import TeamTools
+            from sagents.tool import ToolManager, ToolProxy
+
+            team_tool_manager = ToolManager(is_auto_discover=False, isolated=True)
+            team_tool_manager.register_tools_from_object(TeamTools())
+            team_tools = (
+                ["sys_team_delegate_task"] if request.agent_mode == "team" else []
+            )
+            existing_managers = (
+                list(self.tool_manager.tool_managers)
+                if hasattr(self.tool_manager, "tool_managers")
+                else [self.tool_manager]
+            )
+            self.tool_manager = ToolProxy(
+                [team_tool_manager] + existing_managers,
+                list(set((request.available_tools or []) + team_tools)),
+            )
         self.skill_manager, self.agent_skill_manager = create_skill_proxy(
-            request.available_skills,
+            request.available_skills,  # pyright: ignore[reportArgumentType]
             user_id=self.skill_owner_user_id,
             agent_workspace=self.agent_workspace,
         )
-        self.model_client = create_model_client(request.llm_model_config)
+        self.model_client = create_model_client(request.llm_model_config)  # pyright: ignore[reportArgumentType]
         if _is_desktop_mode():
             self.sage_engine = SAgent(
                 session_root_space=str(self.sessions_root),
@@ -870,14 +963,18 @@ class SageStreamService:
             return
 
         if (not self._workspace_existed) and self.request.agent_id:
-            inherit_service = importlib.import_module("app.server.services.agent_inherit")
+            inherit_service = importlib.import_module(
+                "app.server.services.agent_inherit"
+            )
             await asyncio.to_thread(
                 inherit_service.copy_agent_inherit_to_workspace,
                 self.request.agent_id,
                 self.agent_workspace,
             )
 
-        await asyncio.to_thread(_copy_sage_usage_docs_to_workspace, self.agent_workspace)
+        await asyncio.to_thread(
+            _copy_sage_usage_docs_to_workspace, self.agent_workspace
+        )
 
     async def process_stream(self):
         session_id = self.request.session_id
@@ -892,7 +989,15 @@ class SageStreamService:
         try:
             from sagents.utils.sandbox.config import VolumeMount
 
-            sandbox_agent_workspace = self.agent_workspace
+            team_workspace = None
+            if isinstance(
+                self.request.system_context, dict
+            ) and self.request.system_context.get("team_workspace_mode"):
+                raw_team_workspace = self.request.system_context.get("team_workspace")
+                if raw_team_workspace:
+                    team_workspace = str(raw_team_workspace)
+
+            sandbox_agent_workspace = team_workspace or self.agent_workspace
             volume_mounts = [
                 VolumeMount(
                     host_path=sandbox_agent_workspace,
@@ -929,6 +1034,12 @@ class SageStreamService:
                                 "agent_id": agent.agent_id,
                                 "name": agent.name,
                                 "description": agent.description,
+                                "system_prompt": agent.system_prompt,
+                                "available_tools": agent.available_tools,
+                                "available_skills": agent.available_skills,
+                                "available_workflows": agent.available_workflows,
+                                "system_context": agent.system_context,
+                                "agent_mode": agent.agent_mode,
                             }
                             for agent in (self.request.custom_sub_agents or [])
                         ]
@@ -955,7 +1066,10 @@ class SageStreamService:
                 if not isinstance(chunk, (list, tuple)):
                     continue
                 for message in chunk:
-                    result = message.to_dict()
+                    if isinstance(message, dict):
+                        result = message.copy()
+                    else:
+                        result = message.to_dict()
                     result = ContentProcessor.clean_content(result)
                     yield result
         except Exception as e:
@@ -971,7 +1085,9 @@ class SageStreamService:
             }
 
 
-async def prepare_session(request: StreamRequest) -> Tuple[SageStreamService, asyncio.Lock]:
+async def prepare_session(
+    request: StreamRequest,
+) -> Tuple[SageStreamService, asyncio.Lock]:
     session_id = request.session_id or str(uuid.uuid4())
     request.session_id = session_id
     logger.bind(session_id=session_id).info(
@@ -983,7 +1099,7 @@ async def prepare_session(request: StreamRequest) -> Tuple[SageStreamService, as
     if lock.locked():
         session = get_global_session_manager().get_live_session(session_id)
         if not session or not session.is_interrupted():
-            raise _chat_exception("会话正在运行中，请先调用 interrupt 或使用不同的会话ID")
+            raise _chat_exception("chat.session_running")
 
     try:
         lock_wait_start = time.perf_counter()
@@ -995,12 +1111,12 @@ async def prepare_session(request: StreamRequest) -> Tuple[SageStreamService, as
                 f"Session lock wait slow: {lock_wait_cost:.3f}s"
             )
     except asyncio.TimeoutError:
-        raise _chat_exception("会话正在清理中，请稍后重试")
+        raise _chat_exception("chat.session_cleanup")
 
     try:
         stream_service = SageStreamService(request)
         await stream_service.initialize_workspace_assets()
-        return stream_service, lock
+        return stream_service, lock  # pyright: ignore[reportReturnType]
     except Exception as e:
         if acquired:
             await safe_release(
@@ -1036,7 +1152,7 @@ async def execute_chat_session(
     token_usage_payload: Optional[Dict[str, Any]] = None
 
     progress_queue: asyncio.Queue = asyncio.Queue()
-    register_progress_queue(session_id, progress_queue)
+    register_progress_queue(session_id, progress_queue)  # pyright: ignore[reportArgumentType]
 
     try:
         async for kind, payload in interleave_message_and_progress(
@@ -1058,7 +1174,10 @@ async def execute_chat_session(
                 continue
 
             result = payload
-            token_usage_payload = _extract_token_usage_payload(result) or token_usage_payload
+            if result.get("session_id") == session_id:
+                token_usage_payload = (
+                    _extract_token_usage_payload(result) or token_usage_payload
+                )
 
             yield_result = result.copy()
             yield_result.pop("message_type", None)
@@ -1072,25 +1191,26 @@ async def execute_chat_session(
             token_usage_payload=token_usage_payload,
         )
 
-        yield json.dumps(
-            {
-                "type": "stream_end",
-                "session_id": session_id,
-                "timestamp": time.time(),
-                "total_stream_count": stream_counter,
-            },
-            ensure_ascii=False,
-        ) + "\n"
+        yield (
+            json.dumps(
+                {
+                    "type": "stream_end",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                    "total_stream_count": stream_counter,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
     finally:
-        unregister_progress_queue(session_id)
+        unregister_progress_queue(session_id)  # pyright: ignore[reportArgumentType]
         if not token_usage_persisted:
             await _persist_token_usage_if_available(
                 stream_service,
                 token_usage_payload=token_usage_payload,
             )
         await _finalize_session_end(request, original_skills)
-
-
 
 
 async def _finalize_session_end(
@@ -1101,7 +1221,7 @@ async def _finalize_session_end(
         persist_session_state_with_cancel_protection,
     )
 
-    await persist_session_state_with_cancel_protection(request.session_id)
+    await persist_session_state_with_cancel_protection(request.session_id)  # pyright: ignore[reportArgumentType]
 
     if not _is_desktop_mode() and request.available_skills and request.agent_id:
         asyncio.create_task(_check_and_update_agent_skills(request, original_skills))
@@ -1154,7 +1274,9 @@ async def _persist_token_usage_if_available(
             finished_at=get_local_now(),
         )
     except Exception as e:
-        logger.bind(session_id=request.session_id or "").error(f"token_usage 落库失败: {e}")
+        logger.bind(session_id=request.session_id or "").error(
+            f"token_usage 落库失败: {e}"
+        )
         return False
 
 
@@ -1180,7 +1302,7 @@ async def _check_and_update_agent_skills(
         cfg = _get_cfg()
         agent_skills_path = str(
             get_agent_skill_dir(
-                request.agent_id,
+                request.agent_id,  # pyright: ignore[reportArgumentType]
                 user_id=request.user_id or "default_user",
                 app_mode=cfg.app_mode,
                 ensure_exists=False,
@@ -1197,7 +1319,7 @@ async def _check_and_update_agent_skills(
             return
 
         agent_dao = AgentConfigDao()
-        agent = await agent_dao.get_by_id(request.agent_id)
+        agent = await agent_dao.get_by_id(request.agent_id)  # pyright: ignore[reportArgumentType]
         if agent and agent.config:
             current_skills = set(agent.config.get("availableSkills") or [])
             updated_skills = current_skills | added_in_session
@@ -1214,13 +1336,13 @@ async def _check_and_update_agent_skills(
 
 async def _ensure_conversation(request: StreamRequest) -> None:
     conversation_dao = ConversationDao()
-    existing_conversation = await conversation_dao.get_by_session_id(request.session_id)
+    existing_conversation = await conversation_dao.get_by_session_id(request.session_id)  # pyright: ignore[reportArgumentType]
     if existing_conversation:
         return
 
     await conversation_dao.save_conversation(
         user_id=request.user_id or "default_user",
-        session_id=request.session_id,
+        session_id=request.session_id,  # pyright: ignore[reportArgumentType]
         agent_id=request.agent_id or "default_agent",
         agent_name=request.agent_name or "Sage Assistant",
         title=await create_conversation_title(request),
@@ -1284,9 +1406,12 @@ async def create_conversation_title(request: StreamRequest) -> str:
                 _extract_text_from_content(getattr(request.messages[0], "content", ""))
             )
     else:
-        title_source = _sanitize_title_text(
-            _extract_text_from_content(request.messages[0].content)
-        ) or "新会话"
+        title_source = (
+            _sanitize_title_text(
+                _extract_text_from_content(request.messages[0].content)
+            )
+            or "新会话"
+        )
 
     if not title_source:
         return "新会话"

@@ -4,8 +4,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import json
-from sqlalchemy import JSON, String, Text, func, select, update
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import JSON, String, Text, func, or_, select, update
+from sqlalchemy.orm import Mapped, load_only, mapped_column
 
 from common.models.base import Base, BaseDao, get_local_now
 
@@ -138,6 +138,7 @@ class ConversationDao(BaseDao):
         search: Optional[str] = None,
         agent_id: Optional[str] = None,
         sort_by: str = "date",
+        include_messages: bool = True,
     ) -> tuple[List[Conversation], int]:
         where = []
         if user_id:
@@ -146,7 +147,9 @@ class ConversationDao(BaseDao):
             where.append(Conversation.agent_id == agent_id)
         if search:
             like = f"%{search}%"
-            where.append((Conversation.title.like(like)))
+            where.append(
+                or_(Conversation.title.like(like), Conversation.session_id.like(like))
+            )
 
         if sort_by == "title":
             order = Conversation.title.asc()
@@ -176,6 +179,18 @@ class ConversationDao(BaseDao):
                 return [], total
 
             data_stmt = select(Conversation).where(Conversation.session_id.in_(ids))
+            if not include_messages:
+                data_stmt = data_stmt.options(
+                    load_only(
+                        Conversation.session_id,
+                        Conversation.user_id,
+                        Conversation.agent_id,
+                        Conversation.agent_name,
+                        Conversation.title,
+                        Conversation.created_at,
+                        Conversation.updated_at,
+                    )
+                )
             res = await session.execute(data_stmt)
             items = list(res.scalars().all())
             order_index = {sid: idx for idx, sid in enumerate(ids)}
@@ -196,7 +211,7 @@ class ConversationDao(BaseDao):
                 .values(messages=messages or [], updated_at=get_local_now())
             )
             result = await session.execute(stmt)
-            return bool(result.rowcount)
+            return bool(result.rowcount)  # pyright: ignore[reportAttributeAccessIssue]
 
     async def update_title(self, session_id: str, title: str) -> bool:
         db = await self._get_db()
@@ -207,7 +222,7 @@ class ConversationDao(BaseDao):
                 .values(title=title, updated_at=get_local_now())
             )
             result = await session.execute(stmt)
-            return bool(result.rowcount)
+            return bool(result.rowcount)  # pyright: ignore[reportAttributeAccessIssue]
 
     async def update_timestamp(self, session_id: str) -> bool:
         """仅更新会话的 updated_at 时间戳。"""
@@ -219,7 +234,7 @@ class ConversationDao(BaseDao):
                 .values(updated_at=get_local_now())
             )
             result = await session.execute(stmt)
-            return bool(result.rowcount)
+            return bool(result.rowcount)  # pyright: ignore[reportAttributeAccessIssue]
 
     # Desktop 端兼容方法：不带 user_id 的分页查询（保持原签名）
     async def get_conversations_paginated_desktop(

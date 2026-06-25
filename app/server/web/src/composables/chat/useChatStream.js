@@ -1,4 +1,5 @@
 import { normalizeAgentMode } from '@/utils/agentMode.js'
+import { isCurrentSessionStreamEnd } from '@/utils/sessionStreamEvents.js'
 
 const ENABLE_PLAN_TAG_RE = /^\s*<enable_plan>\s*(true|false)\s*<\/enable_plan>\s*/i
 const ENABLE_DEEP_THINKING_TAG_RE = /^\s*<enable_deep_thinking>\s*(true|false)\s*<\/enable_deep_thinking>\s*/i
@@ -106,6 +107,10 @@ const normalizeResponseLanguage = (language) => {
   return 'en-US'
 }
 
+const STREAM_PROCESS_BUDGET_MS = 12
+
+const yieldToBrowser = () => new Promise(resolve => setTimeout(resolve, 0))
+
 export const useChatStream = ({
   chatAPI,
   toast,
@@ -157,6 +162,7 @@ export const useChatStream = ({
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
+        let batchStartedAt = performance.now()
         for (const line of lines) {
           if (line.trim() === '') continue
           try {
@@ -165,7 +171,12 @@ export const useChatStream = ({
           } catch (e) {
             console.error('JSON Parse Error', e)
           }
+          if (performance.now() - batchStartedAt > STREAM_PROCESS_BUDGET_MS) {
+            await yieldToBrowser()
+            batchStartedAt = performance.now()
+          }
         }
+        await yieldToBrowser()
       }
       if (onComplete) onComplete()
     } catch (e) {
@@ -194,7 +205,7 @@ export const useChatStream = ({
           resumeLastIndex += 1
           updateActiveSessionLastIndex(sessionId, resumeLastIndex)
           if (resumeLastIndex % 20 === 0) updateActiveSessionLastIndex(sessionId, resumeLastIndex, true)
-          if (data.type === 'stream_end') {
+          if (isCurrentSessionStreamEnd(data, sessionId)) {
             updateActiveSessionLastIndex(sessionId, resumeLastIndex, true)
             resumedAndCompleted = true
             markCompletedAndCleanupCurrentSession(sessionId)
@@ -293,11 +304,13 @@ export const useChatStream = ({
         agent_mode: normalizeAgentMode(config.agentMode),
         more_suggest: config.moreSuggest,
         max_loop_count: config.maxLoopCount,
-        available_sub_agent_ids: Array.isArray(config.availableSubAgentIds) ? config.availableSubAgentIds : [],
         agent_id: selectedAgent.id,
         system_context: {
           response_language: normalizeResponseLanguage(language?.value)
         }
+      }
+      if (config.subAgentSelectionMode === 'manual') {
+        requestBody.available_sub_agent_ids = Array.isArray(config.availableSubAgentIds) ? config.availableSubAgentIds : []
       }
       const response = await chatAPI.streamChat(requestBody, abortControllerRef?.value)
       let streamLastIndex = 0
@@ -307,7 +320,7 @@ export const useChatStream = ({
           streamLastIndex += 1
           updateActiveSessionLastIndex(sessionId, streamLastIndex)
           if (streamLastIndex % 20 === 0) updateActiveSessionLastIndex(sessionId, streamLastIndex, true)
-          if (data.type === 'stream_end') {
+          if (isCurrentSessionStreamEnd(data, sessionId)) {
             updateActiveSessionLastIndex(sessionId, streamLastIndex, true)
             markCompletedAndCleanupCurrentSession(sessionId)
           }
@@ -355,11 +368,13 @@ export const useChatStream = ({
         agent_mode: normalizeAgentMode(config?.agentMode),
         more_suggest: config?.moreSuggest,
         max_loop_count: config?.maxLoopCount,
-        available_sub_agent_ids: Array.isArray(config?.availableSubAgentIds) ? config.availableSubAgentIds : [],
         agent_id: selectedAgent?.id,
         system_context: {
           response_language: normalizeResponseLanguage(language?.value)
         }
+      }
+      if (config?.subAgentSelectionMode === 'manual') {
+        requestBody.available_sub_agent_ids = Array.isArray(config?.availableSubAgentIds) ? config.availableSubAgentIds : []
       }
       if (guidanceContent && String(guidanceContent).trim()) {
         requestBody.guidance_content = String(guidanceContent).trim()
@@ -374,7 +389,7 @@ export const useChatStream = ({
           streamLastIndex += 1
           updateActiveSessionLastIndex(sessionId, streamLastIndex)
           if (streamLastIndex % 20 === 0) updateActiveSessionLastIndex(sessionId, streamLastIndex, true)
-          if (data.type === 'stream_end') {
+          if (isCurrentSessionStreamEnd(data, sessionId)) {
             updateActiveSessionLastIndex(sessionId, streamLastIndex, true)
             markCompletedAndCleanupCurrentSession(sessionId)
           }

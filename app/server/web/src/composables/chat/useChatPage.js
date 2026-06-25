@@ -16,6 +16,7 @@ import { usePanelStore } from '@/stores/panel.js'
 import { useWorkbenchStore } from '@/stores/workbench.js'
 import { isToolResultMessage } from '@/utils/messageLabels.js'
 import { mergeToolFunctionArguments } from '@/utils/mergeToolFunctionArguments.js'
+import { getSessionMessageIndexKey } from '@/utils/sessionStreamEvents.js'
 import { getWebBasePath } from '@/config/runtime.js'
 import { storeToRefs } from 'pinia'
 
@@ -239,8 +240,9 @@ export const useChatPage = (props) => {
   const rebuildMessageIdIndexMap = () => {
     const next = new Map()
     messages.value.forEach((item, index) => {
-      if (item?.message_id) {
-        next.set(item.message_id, index)
+      const key = getSessionMessageIndexKey(item, currentSessionId.value)
+      if (key) {
+        next.set(key, index)
       }
     })
     messageIdIndexMap.value = next
@@ -345,11 +347,103 @@ export const useChatPage = (props) => {
       abortControllerRef.value.abort()
       abortControllerRef.value = null
     }
+    cancelPendingStreamUiWork()
     isLoading.value = false
     loadingSessionId.value = null
   }
 
+  let pendingScrollFrame = null
+  let pendingScrollFrameType = null
+  let pendingScrollForce = false
+  const scheduleScrollToBottom = (force = false) => {
+    if (!force && !shouldAutoScroll.value) return
+    pendingScrollForce = pendingScrollForce || force
+    if (pendingScrollFrame !== null) return
+
+    const run = () => {
+      pendingScrollFrame = null
+      pendingScrollFrameType = null
+      const forceNow = pendingScrollForce
+      pendingScrollForce = false
+      scrollToBottom(forceNow)
+    }
+
+    if (typeof requestAnimationFrame === 'function') {
+      pendingScrollFrameType = 'raf'
+      pendingScrollFrame = requestAnimationFrame(run)
+    } else {
+      pendingScrollFrameType = 'timeout'
+      pendingScrollFrame = setTimeout(run, 16)
+    }
+  }
+
+  let workbenchExtractionTimer = null
+  const pendingWorkbenchExtractions = new Map()
+  const getEffectiveAgentId = (message) =>
+    message?.agent_id || selectedAgent.value?.id || selectedAgentId.value || null
+
+  const extractWorkbenchFromMessage = (message) => {
+    if (!message) return
+    const effectiveAgentId = getEffectiveAgentId(message)
+    workbenchStore.extractFromMessage(message, effectiveAgentId)
+
+    if (isToolResultMessage(message) && message.tool_call_id) {
+      const plainToolResult = JSON.parse(JSON.stringify(message))
+      workbenchStore.updateToolResult(message.tool_call_id, plainToolResult, message.session_id)
+      return
+    }
+
+    if (message.tool_calls && message.tool_calls.length > 0) {
+      message.tool_calls.forEach((toolCall) => {
+        const toolResult = toolCall?.function?.result
+        if (toolCall?.id && toolResult) {
+          const plainToolResult = JSON.parse(JSON.stringify(toolResult))
+          workbenchStore.updateToolResult(toolCall.id, plainToolResult, message.session_id)
+        }
+      })
+    }
+  }
+
+  const flushWorkbenchExtractions = () => {
+    workbenchExtractionTimer = null
+    const pending = Array.from(pendingWorkbenchExtractions.values())
+    pendingWorkbenchExtractions.clear()
+    pending.forEach(extractWorkbenchFromMessage)
+  }
+
+  const scheduleWorkbenchExtraction = (message) => {
+    if (!message) return
+    const key = message.message_id || message.id || `${message.session_id || 'session'}:${message.timestamp || Date.now()}`
+    pendingWorkbenchExtractions.set(key, message)
+    if (workbenchExtractionTimer !== null) return
+    workbenchExtractionTimer = setTimeout(flushWorkbenchExtractions, 120)
+  }
+
+  const shouldExtractWorkbenchImmediately = (messageData) =>
+    isToolResultMessage(messageData) ||
+    (Array.isArray(messageData?.tool_calls) && messageData.tool_calls.length > 0)
+
+  function cancelPendingStreamUiWork() {
+    if (workbenchExtractionTimer !== null) {
+      clearTimeout(workbenchExtractionTimer)
+      workbenchExtractionTimer = null
+    }
+    pendingWorkbenchExtractions.clear()
+
+    if (pendingScrollFrame !== null) {
+      if (pendingScrollFrameType === 'raf' && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(pendingScrollFrame)
+      } else {
+        clearTimeout(pendingScrollFrame)
+      }
+      pendingScrollFrame = null
+      pendingScrollFrameType = null
+      pendingScrollForce = false
+    }
+  }
+
   const loadConversationMessages = async (sessionId) => {
+    cancelPendingStreamUiWork()
     // 进入会话时清空工作台
     workbenchStore.clearItems()
     workbenchStore.setSessionId(sessionId)
@@ -378,7 +472,7 @@ export const useChatPage = (props) => {
       workbenchStore.extractFromMessage(message, message.agent_id || conversationAgentId)
       if (isToolResultMessage(message) && message.tool_call_id) {
         const plainToolResult = JSON.parse(JSON.stringify(message))
-        workbenchStore.updateToolResult(message.tool_call_id, plainToolResult)
+        workbenchStore.updateToolResult(message.tool_call_id, plainToolResult, message.session_id)
       }
     })
 
@@ -419,7 +513,8 @@ export const useChatPage = (props) => {
           text: messageData.text,
           stream: messageData.stream,
           closed: !!messageData.closed,
-          ts: messageData.ts
+          ts: messageData.ts,
+          sessionId: messageData.session_id
         })
       } catch (e) {
         console.warn('[Chat] handle tool_progress failed:', e)
@@ -427,30 +522,10 @@ export const useChatPage = (props) => {
       return
     }
     const messageId = messageData.message_id
-    const extractWorkbenchFromMessage = (message) => {
-      if (!message) return
-      const effectiveAgentId = message.agent_id || selectedAgent.value?.id || selectedAgentId.value || null
-      workbenchStore.extractFromMessage(message, effectiveAgentId)
+    const messageIndexKey = getSessionMessageIndexKey(messageData, currentSessionId.value)
 
-      if (isToolResultMessage(message) && message.tool_call_id) {
-        const plainToolResult = JSON.parse(JSON.stringify(message))
-        workbenchStore.updateToolResult(message.tool_call_id, plainToolResult)
-        return
-      }
-
-      if (message.tool_calls && message.tool_calls.length > 0) {
-        message.tool_calls.forEach((toolCall) => {
-          const toolResult = toolCall?.function?.result
-          if (toolCall?.id && toolResult) {
-            const plainToolResult = JSON.parse(JSON.stringify(toolResult))
-            workbenchStore.updateToolResult(toolCall.id, plainToolResult)
-          }
-        })
-      }
-    }
-
-    if (messageId && messageIdIndexMap.value.has(messageId)) {
-      const targetIndex = messageIdIndexMap.value.get(messageId)
+    if (messageIndexKey && messageIdIndexMap.value.has(messageIndexKey)) {
+      const targetIndex = messageIdIndexMap.value.get(messageIndexKey)
       const existing = messages.value[targetIndex]
       if (!existing) {
         rebuildMessageIdIndexMap()
@@ -483,7 +558,11 @@ export const useChatPage = (props) => {
         }
       }
       messages.value.splice(targetIndex, 1, nextMessage)
-      extractWorkbenchFromMessage(nextMessage)
+      if (shouldExtractWorkbenchImmediately(messageData)) {
+        extractWorkbenchFromMessage(nextMessage)
+      } else {
+        scheduleWorkbenchExtraction(nextMessage)
+      }
       return
     }
     const appended = {
@@ -491,12 +570,16 @@ export const useChatPage = (props) => {
       timestamp: messageData.timestamp || Date.now()
     }
     messages.value.push(appended)
-    if (appended.message_id) {
-      messageIdIndexMap.value.set(appended.message_id, messages.value.length - 1)
+    const appendedKey = getSessionMessageIndexKey(appended, currentSessionId.value)
+    if (appendedKey) {
+      messageIdIndexMap.value.set(appendedKey, messages.value.length - 1)
     }
-    extractWorkbenchFromMessage(appended)
-    shouldAutoScroll.value = true
-    nextTick(() => scrollToBottom(true))
+    if (shouldExtractWorkbenchImmediately(messageData)) {
+      extractWorkbenchFromMessage(appended)
+    } else {
+      scheduleWorkbenchExtraction(appended)
+    }
+    scheduleScrollToBottom()
   }
 
   const addUserMessage = (content, sessionId, multimodalContent = null, enableMultimodal = false, messageId = null) => {
@@ -518,7 +601,7 @@ export const useChatPage = (props) => {
       timestamp: Date.now()
     }
     messages.value.push(userMessage)
-    messageIdIndexMap.value.set(userMessage.message_id, messages.value.length - 1)
+    messageIdIndexMap.value.set(getSessionMessageIndexKey(userMessage), messages.value.length - 1)
     return userMessage
   }
 
@@ -531,7 +614,7 @@ export const useChatPage = (props) => {
       timestamp: Date.now()
     }
     messages.value.push(errorMessage)
-    messageIdIndexMap.value.set(errorMessage.message_id, messages.value.length - 1)
+    messageIdIndexMap.value.set(getSessionMessageIndexKey(errorMessage), messages.value.length - 1)
   }
 
   const clearMessages = () => {

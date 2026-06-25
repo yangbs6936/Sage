@@ -10,7 +10,7 @@ export default defineConfig(({ mode }) => {
   const backendApiBaseUrl = 'http://127.0.0.1:30050'
 
   return {
-    base: mode === 'production' ? './' : '/',
+    base: mode === 'production' ? '/sage/' : '/',
     plugins: [
       vue(),
       {
@@ -41,7 +41,15 @@ export default defineConfig(({ mode }) => {
     },
     build: {
       sourcemap: false,
+      reportCompressedSize: false,
       rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (id.includes('/node_modules/highlight.js/')) {
+              return 'vendor-highlight'
+            }
+          }
+        },
         onwarn(warning, warn) {
           if (warning.code === 'MODULE_LEVEL_DIRECTIVE') {
             return

@@ -23,7 +23,7 @@ def _get_tool_manager_or_raise():
     if not tool_manager:
         raise SageHTTPException(
             status_code=500,
-            detail="工具管理器未初始化",
+            message_key="tool.manager_not_initialized",
             error_detail="Tool manager not initialized",
         )
     return tool_manager
@@ -76,7 +76,11 @@ def _normalize_tool_result(tool_response: Any) -> Dict[str, Any]:
         if parsed is None:
             parsed = tool_response.get("result")
         if not raw_text:
-            raw_text = tool_response.get("content") if isinstance(tool_response.get("content"), str) else ""
+            raw_text = (
+                tool_response.get("content")
+                if isinstance(tool_response.get("content"), str)
+                else ""
+            )
     elif isinstance(tool_response, str):
         raw_text = tool_response
         parsed = tool_response
@@ -85,7 +89,7 @@ def _normalize_tool_result(tool_response: Any) -> Dict[str, Any]:
 
     parsed = _try_parse_json_like(parsed)
     if not raw_text:
-        raw_text = _format_result_text(parsed, raw_text)
+        raw_text = _format_result_text(parsed, raw_text)  # pyright: ignore[reportArgumentType]
     formatted_text = _format_result_text(parsed, raw_text)
 
     return {
@@ -115,12 +119,12 @@ async def execute_tool(
         logger.error(f"执行工具失败: {tool_name}")
         raise SageHTTPException(
             status_code=500,
-            detail="工具不存在",
+            message_key="tool.not_found",
             error_detail=f"Tool '{tool_name}' not found",
         )
 
     if role != "admin":
-        tool_info = tool_manager.get_tool_info(tool_name)
+        tool_info = tool_manager.get_tool_info(tool_name)  # pyright: ignore[reportAttributeAccessIssue]
         tool_type = tool_info.get("type", "basic")
         if tool_type == "mcp":
             source = normalize_tool_source(tool_info.get("source", "internal"))
@@ -128,15 +132,19 @@ async def execute_tool(
             server = await dao.get_by_name(source)
             if server and server.user_id and server.user_id != user_id:
                 raise SageHTTPException(
-                    detail="无权使用该工具",
+                    message_key="tool.use_forbidden",
                     error_detail="Permission denied",
                 )
+
+    safe_tool_params = dict(tool_params)
+    safe_tool_params.pop("session_id", None)
+    safe_tool_params.pop("user_id", None)
 
     tool_response = await tool_manager.run_tool_async(
         tool_name=tool_name,
         session_id="",
         user_id=user_id,
-        **tool_params,
+        **safe_tool_params,
     )
     if tool_response is not None:
         logger.info(f"执行工具成功: {tool_name}")
@@ -145,7 +153,7 @@ async def execute_tool(
     logger.error(f"执行工具失败: {tool_name}")
     raise SageHTTPException(
         status_code=500,
-        detail="工具执行失败",
+        message_key="tool.execution_failed",
         error_detail=f"Tool '{tool_name}' execution failed",
     )
 

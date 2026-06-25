@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import Any, Dict, Mapping, Optional
 
@@ -45,7 +46,9 @@ def uses_max_completion_tokens(model: Optional[str]) -> bool:
     return False
 
 
-def _remap_max_tokens_for_model(request_kwargs: Dict[str, Any], model: Optional[str]) -> None:
+def _remap_max_tokens_for_model(
+    request_kwargs: Dict[str, Any], model: Optional[str]
+) -> None:
     if not uses_max_completion_tokens(model):
         return
     if "max_tokens" not in request_kwargs:
@@ -201,7 +204,9 @@ def sanitize_model_request_kwargs(
         if not isinstance(resolved_model, str):
             resolved_model = None
     _remap_max_tokens_for_model(sanitized, resolved_model)
-    structured_support = get_structured_output_support(client=client, model_config=model_config)
+    structured_support = get_structured_output_support(
+        client=client, model_config=model_config
+    )
     if structured_support is False:
         sanitized.pop("response_format", None)
     _drop_reasoning_effort_when_tools_present(sanitized)
@@ -216,6 +221,49 @@ def is_unsupported_input_format_error(exc: Exception) -> bool:
         or "unsupported_input_format" in error_text
         or ("invalidparameter" in error_text and "input format" in error_text)
     )
+
+
+def _unknown_parameter_name(exc: Exception) -> Optional[str]:
+    body = getattr(exc, "body", None)
+    if isinstance(body, Mapping):
+        error = body.get("error")
+        if isinstance(error, Mapping):
+            code = str(error.get("code") or "").lower()
+            param = error.get("param")
+            message = str(error.get("message") or "")
+            if code == "unknown_parameter" and isinstance(param, str) and param:
+                return param
+            match = re.search(r"Unknown parameter:\s*'([^']+)'", message)
+            if match:
+                return match.group(1)
+    param = getattr(exc, "param", None)
+    if isinstance(param, str) and param:
+        error_text = str(exc).lower()
+        if "unknown parameter" in error_text or "unknown_parameter" in error_text:
+            return param
+    match = re.search(r"Unknown parameter:\s*'([^']+)'", str(exc))
+    if match:
+        return match.group(1)
+    return None
+
+
+def _drop_unknown_request_parameter(request_kwargs: Dict[str, Any], param: str) -> bool:
+    if not param:
+        return False
+    candidates = [param, param.split(".")[-1]]
+    for key in candidates:
+        if key in request_kwargs:
+            request_kwargs.pop(key, None)
+            return True
+    extra_body = request_kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        for key in candidates:
+            if key in extra_body:
+                request_kwargs["extra_body"] = {
+                    k: v for k, v in extra_body.items() if k != key
+                }
+                return True
+    return False
 
 
 def format_api_error_details(exc: APIError) -> str:
@@ -280,26 +328,36 @@ def _sanitize_for_log(value: Any, *, max_depth: int = 2, max_items: int = 8) -> 
         result: Dict[str, Any] = {}
         for key, item in items[:max_items]:
             key_str = str(key)
-            if any(token in key_str.lower() for token in ("key", "token", "secret", "password", "authorization")):
+            if any(
+                token in key_str.lower()
+                for token in ("key", "token", "secret", "password", "authorization")
+            ):
                 result[key_str] = "<redacted>"
             else:
-                result[key_str] = _sanitize_for_log(item, max_depth=max_depth - 1, max_items=max_items)
+                result[key_str] = _sanitize_for_log(
+                    item, max_depth=max_depth - 1, max_items=max_items
+                )
         if len(items) > max_items:
             result["..."] = f"+{len(items) - max_items} more"
         return result
 
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
         items = list(value)
-        result = [_sanitize_for_log(item, max_depth=max_depth - 1, max_items=max_items) for item in items[:max_items]]
+        result = [  # pyright: ignore[reportAssignmentType]
+            _sanitize_for_log(item, max_depth=max_depth - 1, max_items=max_items)
+            for item in items[:max_items]
+        ]
         if len(items) > max_items:
-            result.append(f"... +{len(items) - max_items} more")
+            result.append(f"... +{len(items) - max_items} more")  # pyright: ignore[reportAttributeAccessIssue]
         return result
 
     return f"<{type(value).__name__}>"
 
 
 def summarize_chat_completion_messages(messages: Any) -> Any:
-    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes, bytearray)):
+    if not isinstance(messages, Sequence) or isinstance(
+        messages, (str, bytes, bytearray)
+    ):
         return _sanitize_for_log(messages)
 
     summary = []
@@ -313,7 +371,9 @@ def summarize_chat_completion_messages(messages: Any) -> Any:
             if isinstance(content, str):
                 item["content_type"] = "str"
                 item["content_len"] = len(content)
-            elif isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
+            elif isinstance(content, Sequence) and not isinstance(
+                content, (str, bytes, bytearray)
+            ):
                 item["content_type"] = "list"
                 item["content_len"] = len(content)
                 item["content_preview"] = _sanitize_for_log(content, max_depth=1)
@@ -322,7 +382,9 @@ def summarize_chat_completion_messages(messages: Any) -> Any:
 
             if message.get("tool_calls") is not None:
                 tool_calls = message.get("tool_calls")
-                if isinstance(tool_calls, Sequence) and not isinstance(tool_calls, (str, bytes, bytearray)):
+                if isinstance(tool_calls, Sequence) and not isinstance(
+                    tool_calls, (str, bytes, bytearray)
+                ):
                     item["tool_calls_len"] = len(tool_calls)
                 else:
                     item["tool_calls_type"] = type(tool_calls).__name__
@@ -377,25 +439,41 @@ async def create_chat_completion_with_fallback(
         f"[LLM Request] chat.completions.create | summary={summarize_chat_completion_request(model=model, messages=messages, request_kwargs=request_kwargs, model_config=model_config)}"
     )
 
-    try:
-        return await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            **request_kwargs,
-        )
-    except APIError as exc:
-        if response_format is not None and "response_format" in request_kwargs and is_unsupported_input_format_error(exc):
-            logger.warning(
-                f"模型后端不支持 structured output，自动移除 response_format 后重试: model={model}, details={format_api_error_details(exc)}"
-            )
-            retry_kwargs = dict(request_kwargs)
-            retry_kwargs.pop("response_format", None)
-            logger.debug(
-                f"[LLM Request] chat.completions.create retry_without_response_format | summary={summarize_chat_completion_request(model=model, messages=messages, request_kwargs=retry_kwargs, model_config=model_config)}"
-            )
+    unknown_parameter_retry_count = 0
+    structured_output_fallback_used = False
+    while True:
+        try:
             return await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                **retry_kwargs,
+                **request_kwargs,
             )
-        raise
+        except APIError as exc:
+            if (
+                response_format is not None
+                and not structured_output_fallback_used
+                and "response_format" in request_kwargs
+                and is_unsupported_input_format_error(exc)
+            ):
+                structured_output_fallback_used = True
+                request_kwargs = dict(request_kwargs)
+                request_kwargs.pop("response_format", None)
+                logger.warning(
+                    f"模型后端不支持 structured output，自动移除 response_format 后重试: model={model}, details={format_api_error_details(exc)}"
+                )
+                logger.debug(
+                    f"[LLM Request] chat.completions.create retry_without_response_format | summary={summarize_chat_completion_request(model=model, messages=messages, request_kwargs=request_kwargs, model_config=model_config)}"
+                )
+                continue
+
+            unknown_param = _unknown_parameter_name(exc)
+            if unknown_param and unknown_parameter_retry_count < 5:
+                retry_kwargs = dict(request_kwargs)
+                if _drop_unknown_request_parameter(retry_kwargs, unknown_param):
+                    unknown_parameter_retry_count += 1
+                    request_kwargs = retry_kwargs
+                    logger.warning(
+                        f"模型后端不支持请求参数，已移除后重试: model={model}, param={unknown_param}, details={format_api_error_details(exc)}"
+                    )
+                    continue
+            raise

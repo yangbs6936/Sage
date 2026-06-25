@@ -20,7 +20,10 @@ RAW_ASSISTANT_BLOCK_PATTERNS = (
     re.compile(r"(^|\n)\s*<skill_input>.*?</skill_input>", re.DOTALL),
     re.compile(r"(^|\n)\s*<skill_result>.*?</skill_result>", re.DOTALL),
     re.compile(r"(^|\n)\s*<call\s+function=\"[A-Za-z0-9_.-]+\".*?</call>", re.DOTALL),
-    re.compile(r"(^|\n)\s*<function_result\s+name=\"[A-Za-z0-9_.-]+\".*?</function_result>", re.DOTALL),
+    re.compile(
+        r"(^|\n)\s*<function_result\s+name=\"[A-Za-z0-9_.-]+\".*?</function_result>",
+        re.DOTALL,
+    ),
     re.compile(r"(^|\n)\s*<function_results>.*?</function_results>", re.DOTALL),
     re.compile(r"(^|\n)\s*<tool_name>\s*.*?</tool_name>", re.DOTALL),
     re.compile(r"(^|\n)\s*<｜DSML｜tool_calls>.*?</｜DSML｜tool_calls>", re.DOTALL),
@@ -36,6 +39,24 @@ RAW_ASSISTANT_START_PATTERNS = (
     re.compile(r"(^|\n)\s*<tool_name>"),
     re.compile(r"(^|\n)\s*<｜DSML｜"),
 )
+INTERNAL_SELF_CHECK_PATTERNS = (
+    re.compile(
+        r"Self-check: Repeating execution loop detected.*?clarification question\.",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"自检：检测到执行出现重复循环模式.*?最小必要澄清问题。",
+        re.DOTALL,
+    ),
+)
+INTERNAL_ASSISTANT_EVENT_TYPES = {
+    "analysis",
+    "observation",
+    "plan",
+    "reasoning_content",
+    "task_analysis",
+    "thinking",
+}
 
 
 def _empty_render_state() -> Dict[str, Any]:
@@ -51,7 +72,7 @@ def _empty_render_state() -> Dict[str, Any]:
 
 
 def _split_visible_assistant_content(buffer: str) -> tuple[str, str]:
-    working = buffer
+    working = _strip_internal_self_check(buffer)
     previous = None
     while working != previous:
         previous = working
@@ -71,6 +92,13 @@ def _split_visible_assistant_content(buffer: str) -> tuple[str, str]:
     return working[:split_at], working[split_at:]
 
 
+def _strip_internal_self_check(text: str) -> str:
+    cleaned = text
+    for pattern in INTERNAL_SELF_CHECK_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    return cleaned
+
+
 def _render_assistant_content_delta(render_state: Dict[str, Any], content: str) -> str:
     buffer = (render_state.get("assistant_buffer") or "") + content
     visible, pending = _split_visible_assistant_content(buffer)
@@ -85,7 +113,9 @@ def _render_assistant_content_delta(render_state: Dict[str, Any], content: str) 
     return delta
 
 
-def _collect_event_tool_names(event: Dict[str, Any], *, content_buffer: str = "") -> List[str]:
+def _collect_event_tool_names(
+    event: Dict[str, Any], *, content_buffer: str = ""
+) -> List[str]:
     tool_names: List[str] = []
 
     tool_calls = event.get("tool_calls") or []
@@ -128,7 +158,9 @@ def _collect_event_tool_names(event: Dict[str, Any], *, content_buffer: str = ""
     return sorted(set(tool_names))
 
 
-def _collect_event_file_paths(event: Dict[str, Any], *, content_buffer: str = "") -> List[str]:
+def _collect_event_file_paths(
+    event: Dict[str, Any], *, content_buffer: str = ""
+) -> List[str]:
     file_paths: List[str] = []
 
     tool_calls = event.get("tool_calls") or []
@@ -169,11 +201,16 @@ def _collect_event_file_paths(event: Dict[str, Any], *, content_buffer: str = ""
 
 
 def _buffer_has_skill_io_markup(buffer: str) -> bool:
-    return bool(SKILL_INPUT_TAG_PATTERN.search(buffer) or SKILL_RESULT_TAG_PATTERN.search(buffer))
+    return bool(
+        SKILL_INPUT_TAG_PATTERN.search(buffer)
+        or SKILL_RESULT_TAG_PATTERN.search(buffer)
+    )
 
 
 def _print_plain_event(event: Dict[str, Any], render_state: Dict[str, Any]) -> None:
     event_type = event.get("type")
+    if event_type in INTERNAL_ASSISTANT_EVENT_TYPES:
+        return
     if event_type == "stream_end":
         if not sys.stdout.isatty():
             return
@@ -186,7 +223,9 @@ def _print_plain_event(event: Dict[str, Any], render_state: Dict[str, Any]) -> N
         tool_tag_buffer = (render_state.get("tool_tag_buffer") or "") + content
         render_state["tool_tag_buffer"] = tool_tag_buffer[-2048:]
 
-    names = _collect_event_tool_names(event, content_buffer=render_state.get("tool_tag_buffer") or "")
+    names = _collect_event_tool_names(
+        event, content_buffer=render_state.get("tool_tag_buffer") or ""
+    )
     if names:
         announced_tools = render_state.setdefault("announced_tools", set())
         unseen_names = [name for name in names if name not in announced_tools]
@@ -197,7 +236,9 @@ def _print_plain_event(event: Dict[str, Any], render_state: Dict[str, Any]) -> N
             sys.stderr.write(f"\n[tool] {', '.join(unseen_names)}\n")
             sys.stderr.flush()
 
-    file_paths = _collect_event_file_paths(event, content_buffer=render_state.get("tool_tag_buffer") or "")
+    file_paths = _collect_event_file_paths(
+        event, content_buffer=render_state.get("tool_tag_buffer") or ""
+    )
     if file_paths:
         announced_file_paths = render_state.setdefault("announced_file_paths", set())
         unseen_paths = [path for path in file_paths if path not in announced_file_paths]
@@ -231,7 +272,9 @@ def _build_stream_idle_notice(idle_seconds: float) -> str:
     return f"[working] still running ({idle_seconds:.1f}s since last event)"
 
 
-def _emit_stream_idle_notice_for_state(render_state: Dict[str, Any], idle_seconds: float) -> None:
+def _emit_stream_idle_notice_for_state(
+    render_state: Dict[str, Any], idle_seconds: float
+) -> None:
     message = _build_stream_idle_notice_for_state(render_state, idle_seconds)
     if not message:
         return

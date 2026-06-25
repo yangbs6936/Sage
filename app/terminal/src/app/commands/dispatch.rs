@@ -5,6 +5,7 @@ use crate::slash_command;
 
 use super::agent::normalize_agent_mode;
 use super::display::parse_display_mode;
+use super::sandbox::normalize_sandbox_type;
 
 impl App {
     pub(crate) fn handle_command(&mut self, command: &str) -> SubmitAction {
@@ -50,8 +51,7 @@ impl App {
             "/clear" => {
                 self.pending_history_lines.clear();
                 self.committed_history_lines.clear();
-                self.live_message = None;
-                self.live_message_had_history = false;
+                self.clear_live_response_state();
                 self.clear_requested = true;
                 self.status = format!("cleared  {}", self.session_id);
                 self.queue_welcome_banner();
@@ -167,7 +167,7 @@ impl App {
                 let rest = parts.map(ToString::to_string).collect::<Vec<_>>();
                 match subcommand.as_deref() {
                     None | Some("help") if rest.is_empty() => {
-                        self.queue_message(MessageKind::Tool, provider_help_text());
+                        self.queue_message(MessageKind::System, provider_help_text());
                         self.status = format!("provider help  {}", self.session_id);
                         SubmitAction::Handled
                     }
@@ -220,34 +220,42 @@ impl App {
                     SubmitAction::Handled
                 }
             },
-            "/agent" => match (parts.next(), parts.next(), parts.next()) {
-                (None, None, None) | (Some("show"), None, None) => {
-                    self.queue_agent_status();
-                    SubmitAction::Handled
+            "/agent" => {
+                let subcommand = parts.next();
+                let rest = parts.map(ToString::to_string).collect::<Vec<_>>();
+                match subcommand {
+                    None | Some("show") if rest.is_empty() => {
+                        self.queue_agent_status();
+                        SubmitAction::Handled
+                    }
+                    Some("list") if rest.is_empty() => SubmitAction::ListAgents,
+                    Some("set") if rest.len() == 1 => {
+                        self.set_selected_agent_id(rest[0].clone());
+                        SubmitAction::Handled
+                    }
+                    Some("config") if !rest.is_empty() => {
+                        self.set_agent_config_path(rest.join(" "));
+                        SubmitAction::Handled
+                    }
+                    Some("clear") if rest.is_empty() => {
+                        self.clear_selected_agent_id();
+                        SubmitAction::Handled
+                    }
+                    _ => {
+                        self.queue_message(
+                            MessageKind::System,
+                            "Usage: /agent | /agent show | /agent list | /agent set <agent_id> | /agent config <path|coding> | /agent clear",
+                        );
+                        self.status = format!("invalid command  {}", self.session_id);
+                        SubmitAction::Handled
+                    }
                 }
-                (Some("list"), None, None) => SubmitAction::ListAgents,
-                (Some("set"), Some(agent_id), None) => {
-                    self.set_selected_agent_id(agent_id.to_string());
-                    SubmitAction::Handled
-                }
-                (Some("clear"), None, None) => {
-                    self.clear_selected_agent_id();
-                    SubmitAction::Handled
-                }
-                _ => {
-                    self.queue_message(
-                        MessageKind::System,
-                        "Usage: /agent | /agent show | /agent list | /agent set <agent_id> | /agent clear",
-                    );
-                    self.status = format!("invalid command  {}", self.session_id);
-                    SubmitAction::Handled
-                }
-            },
+            }
             "/mode" => match (parts.next(), parts.next(), parts.next()) {
                 (None, None, None) | (Some("show"), None, None) => {
                     self.queue_message(
                         MessageKind::System,
-                        format!("agent_mode: {}", self.agent_mode),
+                        format!("agent_mode: {}", self.agent_mode_status_label()),
                     );
                     self.status = format!("mode  {}", self.session_id);
                     SubmitAction::Handled
@@ -329,6 +337,40 @@ impl App {
                     }
                 }
             }
+            "/sandbox" => match (parts.next(), parts.next(), parts.next()) {
+                (None, None, None) | (Some("show"), None, None) => {
+                    self.queue_sandbox_status();
+                    SubmitAction::Handled
+                }
+                (Some("set"), Some(sandbox_type), None) => {
+                    match normalize_sandbox_type(sandbox_type) {
+                        Some(sandbox_type) => {
+                            self.set_sandbox_type_selection(sandbox_type);
+                            SubmitAction::Handled
+                        }
+                        None => {
+                            self.queue_message(
+                            MessageKind::System,
+                            "Usage: /sandbox | /sandbox show | /sandbox set <local|remote|passthrough> | /sandbox clear",
+                        );
+                            self.status = format!("invalid command  {}", self.session_id);
+                            SubmitAction::Handled
+                        }
+                    }
+                }
+                (Some("clear"), None, None) => {
+                    self.clear_sandbox_type_selection();
+                    SubmitAction::Handled
+                }
+                _ => {
+                    self.queue_message(
+                        MessageKind::System,
+                        "Usage: /sandbox | /sandbox show | /sandbox set <local|remote|passthrough> | /sandbox clear",
+                    );
+                    self.status = format!("invalid command  {}", self.session_id);
+                    SubmitAction::Handled
+                }
+            },
             "/goal" => {
                 let subcommand = parts.next();
                 let rest = parts.map(ToString::to_string).collect::<Vec<_>>();
@@ -392,57 +434,61 @@ impl App {
                 }
             },
             "/status" => {
-                self.queue_message(
-                    MessageKind::System,
+                let mut lines = vec![format!(
+                    "status: {}",
+                    if self.busy { "working" } else { "ready" }
+                )];
+                lines.push(format!("session: {}", self.session_id));
+                if let Some(agent_config) = self.agent_config_path.as_ref() {
+                    lines.push(format!("agent: config {}", agent_config.display()));
+                } else {
+                    lines.push(format!("agent: {}", self.agent_id_status_label()));
+                }
+                lines.extend([
+                    format!("mode: {}", self.agent_mode_status_label()),
+                    format!("workspace: {}", self.workspace_label),
+                    format!("sandbox: {}", self.sandbox_type_status_label()),
                     format!(
-                        "session: {}\nbusy: {}\nagent_id: {}\nagent_mode: {}\ndisplay_mode: {}\nworkspace: {}\ngoal: {}\ngoal_status: {}\ngoal_pending: {}\nmax_loop_count: {}\nskills: {}\nmodel_override: {}\ninput: {} chars",
-                        self.session_id,
-                        self.busy,
-                        self.selected_agent_id
-                            .clone()
-                            .unwrap_or_else(|| "(default)".to_string()),
-                        self.agent_mode,
-                        display_mode_name(self.display_mode),
-                        self.workspace_label,
-                        self.current_goal
-                            .as_ref()
-                            .map(|goal| goal.objective.clone())
-                            .unwrap_or_else(|| "(none)".to_string()),
-                        self.current_goal
-                            .as_ref()
-                            .map(|goal| goal.status.clone())
-                            .unwrap_or_else(|| "(none)".to_string()),
-                        self.pending_goal_mutation
-                            .as_ref()
-                            .map(|pending| {
-                                if pending.clear {
-                                    "clear".to_string()
-                                } else if let Some(objective) = &pending.objective {
-                                    format!(
-                                        "set:{} ({})",
-                                        objective,
-                                        pending
-                                            .status
-                                            .clone()
-                                            .unwrap_or_else(|| "active".to_string())
-                                    )
-                                } else {
-                                    pending.status.clone().unwrap_or_else(|| "(none)".to_string())
-                                }
-                            })
-                            .unwrap_or_else(|| "(none)".to_string()),
-                        self.max_loop_count,
-                        if self.selected_skills.is_empty() {
-                            "(none)".to_string()
+                        "sandbox restart: {}",
+                        if self.backend_restart_requested {
+                            "pending"
                         } else {
-                            self.selected_skills.join(", ")
-                        },
-                        self.selected_model
-                            .clone()
-                            .unwrap_or_else(|| "(none)".to_string()),
-                        self.input.chars().count(),
+                            "not pending"
+                        }
                     ),
-                );
+                    format!("display: {}", display_mode_name(self.display_mode)),
+                    format!("loop limit: {}", self.max_loop_count_status_label()),
+                ]);
+                if let Some(goal) = &self.current_goal {
+                    lines.push(format!("goal: {} ({})", goal.objective, goal.status));
+                }
+                if let Some(pending) = &self.pending_goal_mutation {
+                    let pending_label = if pending.clear {
+                        "clear".to_string()
+                    } else if let Some(objective) = &pending.objective {
+                        format!(
+                            "set:{} ({})",
+                            objective,
+                            pending
+                                .status
+                                .clone()
+                                .unwrap_or_else(|| "active".to_string())
+                        )
+                    } else {
+                        pending
+                            .status
+                            .clone()
+                            .unwrap_or_else(|| "pending".to_string())
+                    };
+                    lines.push(format!("goal pending: {}", pending_label));
+                }
+                if !self.selected_skills.is_empty() {
+                    lines.push(format!("skills: {}", self.selected_skills.join(", ")));
+                }
+                if let Some(model) = &self.selected_model {
+                    lines.push(format!("model: {}", model));
+                }
+                self.queue_message(MessageKind::System, lines.join("\n"));
                 self.status = format!("status  {}", self.session_id);
                 SubmitAction::Handled
             }

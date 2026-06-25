@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import os
 import re
 import resource
@@ -20,6 +21,7 @@ _DYNAMIC_PATH_SEGMENT_RE = re.compile(
 class _HttpMetricState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     requests_total: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    request_last_seen: dict[tuple[str, str, str], float] = field(default_factory=dict)
     duration_sum: dict[tuple[str, str], float] = field(default_factory=dict)
     duration_count: dict[tuple[str, str], int] = field(default_factory=dict)
     duration_buckets: dict[tuple[str, str, float], int] = field(default_factory=dict)
@@ -36,13 +38,22 @@ class _OperationMetricState:
     active: dict[tuple[str, str], int] = field(default_factory=dict)
 
 
+@dataclass
+class _SseFailureMetricState:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    failures_total: dict[tuple[str, str, str, str], int] = field(default_factory=dict)
+
+
 _HTTP_STATE = _HttpMetricState()
 _OPERATION_STATE = _OperationMetricState()
+_SSE_FAILURE_STATE = _SseFailureMetricState()
+_SSE_FAILURE_STATUSES = frozenset({"error", "cancelled", "fallback_missing"})
 
 
 def _reset_prometheus_metrics_state() -> None:
     with _HTTP_STATE.lock:
         _HTTP_STATE.requests_total.clear()
+        _HTTP_STATE.request_last_seen.clear()
         _HTTP_STATE.duration_sum.clear()
         _HTTP_STATE.duration_count.clear()
         _HTTP_STATE.duration_buckets.clear()
@@ -53,6 +64,8 @@ def _reset_prometheus_metrics_state() -> None:
         _OPERATION_STATE.duration_count.clear()
         _OPERATION_STATE.duration_buckets.clear()
         _OPERATION_STATE.active.clear()
+    with _SSE_FAILURE_STATE.lock:
+        _SSE_FAILURE_STATE.failures_total.clear()
 
 
 def _metric_line(name: str, value: int | float) -> str:
@@ -60,11 +73,15 @@ def _metric_line(name: str, value: int | float) -> str:
 
 
 def _labeled_metric_line(name: str, labels: dict[str, str], value: int | float) -> str:
-    rendered_labels = ",".join(f'{key}="{_escape_label_value(val)}"' for key, val in labels.items())
+    rendered_labels = ",".join(
+        f'{key}="{_escape_label_value(val)}"' for key, val in labels.items()
+    )
     return f"{name}{{{rendered_labels}}} {float(value):.6f}"
 
 
-def _metric_block(name: str, description: str, metric_type: str, value: int | float) -> list[str]:
+def _metric_block(
+    name: str, description: str, metric_type: str, value: int | float
+) -> list[str]:
     return [
         f"# HELP {name} {description}",
         f"# TYPE {name} {metric_type}",
@@ -76,15 +93,24 @@ def _escape_label_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
+def _session_trace_id(session_id: str) -> str:
+    return hashlib.md5(str(session_id or "unknown").encode("utf-8")).hexdigest()
+
+
 def _route_template(path: str, route_path: str | None) -> str:
     if route_path:
         return route_path
     if not path:
         return "unknown"
-    return "/".join("{id}" if _DYNAMIC_PATH_SEGMENT_RE.match(segment) else segment for segment in path.split("/"))
+    return "/".join(
+        "{id}" if _DYNAMIC_PATH_SEGMENT_RE.match(segment) else segment
+        for segment in path.split("/")
+    )
 
 
-def start_http_request(method: str, path: str, route_path: str | None = None) -> tuple[float, str, str]:
+def start_http_request(
+    method: str, path: str, route_path: str | None = None
+) -> tuple[float, str, str]:
     normalized_method = (method or "GET").upper()
     normalized_path = _route_template(path, route_path)
     with _HTTP_STATE.lock:
@@ -93,20 +119,29 @@ def start_http_request(method: str, path: str, route_path: str | None = None) ->
     return time.perf_counter(), normalized_method, normalized_path
 
 
-def finish_http_request(started_at: float, method: str, path: str, status_code: int | str) -> None:
+def finish_http_request(
+    started_at: float, method: str, path: str, status_code: int | str
+) -> None:
     duration = max(time.perf_counter() - started_at, 0.0)
     status = str(status_code)
     key = (method, path)
     status_key = (method, path, status)
 
     with _HTTP_STATE.lock:
-        _HTTP_STATE.requests_total[status_key] = _HTTP_STATE.requests_total.get(status_key, 0) + 1
-        _HTTP_STATE.duration_sum[key] = _HTTP_STATE.duration_sum.get(key, 0.0) + duration
+        _HTTP_STATE.requests_total[status_key] = (
+            _HTTP_STATE.requests_total.get(status_key, 0) + 1
+        )
+        _HTTP_STATE.request_last_seen[status_key] = time.time()
+        _HTTP_STATE.duration_sum[key] = (
+            _HTTP_STATE.duration_sum.get(key, 0.0) + duration
+        )
         _HTTP_STATE.duration_count[key] = _HTTP_STATE.duration_count.get(key, 0) + 1
         for bucket in _HTTP_DURATION_BUCKETS:
             if duration <= bucket:
                 bucket_key = (method, path, bucket)
-                _HTTP_STATE.duration_buckets[bucket_key] = _HTTP_STATE.duration_buckets.get(bucket_key, 0) + 1
+                _HTTP_STATE.duration_buckets[bucket_key] = (
+                    _HTTP_STATE.duration_buckets.get(bucket_key, 0) + 1
+                )
         in_progress = _HTTP_STATE.in_progress.get(key, 0)
         _HTTP_STATE.in_progress[key] = max(in_progress - 1, 0)
 
@@ -127,15 +162,41 @@ def finish_operation(started_at: float, category: str, name: str, status: str) -
     status_key = (category, name, normalized_status)
 
     with _OPERATION_STATE.lock:
-        _OPERATION_STATE.total[status_key] = _OPERATION_STATE.total.get(status_key, 0) + 1
-        _OPERATION_STATE.duration_sum[key] = _OPERATION_STATE.duration_sum.get(key, 0.0) + duration
-        _OPERATION_STATE.duration_count[key] = _OPERATION_STATE.duration_count.get(key, 0) + 1
+        _OPERATION_STATE.total[status_key] = (
+            _OPERATION_STATE.total.get(status_key, 0) + 1
+        )
+        _OPERATION_STATE.duration_sum[key] = (
+            _OPERATION_STATE.duration_sum.get(key, 0.0) + duration
+        )
+        _OPERATION_STATE.duration_count[key] = (
+            _OPERATION_STATE.duration_count.get(key, 0) + 1
+        )
         for bucket in _HTTP_DURATION_BUCKETS:
             if duration <= bucket:
                 bucket_key = (category, name, bucket)
-                _OPERATION_STATE.duration_buckets[bucket_key] = _OPERATION_STATE.duration_buckets.get(bucket_key, 0) + 1
+                _OPERATION_STATE.duration_buckets[bucket_key] = (
+                    _OPERATION_STATE.duration_buckets.get(bucket_key, 0) + 1
+                )
         active = _OPERATION_STATE.active.get(key, 0)
         _OPERATION_STATE.active[key] = max(active - 1, 0)
+
+
+def record_sse_stream_failure(stream: str, session_id: str, status: str) -> None:
+    normalized_status = (status or "unknown").strip() or "unknown"
+    if normalized_status not in _SSE_FAILURE_STATUSES:
+        return
+    normalized_stream = (stream or "unknown").strip() or "unknown"
+    normalized_session_id = (session_id or "unknown").strip() or "unknown"
+    key = (
+        normalized_stream,
+        normalized_session_id,
+        _session_trace_id(normalized_session_id),
+        normalized_status,
+    )
+    with _SSE_FAILURE_STATE.lock:
+        _SSE_FAILURE_STATE.failures_total[key] = (
+            _SSE_FAILURE_STATE.failures_total.get(key, 0) + 1
+        )
 
 
 def _parse_proc_status() -> dict[str, int]:
@@ -241,6 +302,7 @@ def _render_http_metrics() -> list[str]:
     ]
     with _HTTP_STATE.lock:
         requests_total = dict(_HTTP_STATE.requests_total)
+        request_last_seen = dict(_HTTP_STATE.request_last_seen)
         duration_sum = dict(_HTTP_STATE.duration_sum)
         duration_count = dict(_HTTP_STATE.duration_count)
         duration_buckets = dict(_HTTP_STATE.duration_buckets)
@@ -252,6 +314,21 @@ def _render_http_metrics() -> list[str]:
                 "sage_server_http_requests_total",
                 {"method": method, "path": path, "status": status},
                 requests_total[(method, path, status)],
+            )
+        )
+
+    lines.extend(
+        [
+            "# HELP sage_server_http_request_last_seen_timestamp_seconds Unix timestamp of the most recent completed HTTP request by method, path, and status.",
+            "# TYPE sage_server_http_request_last_seen_timestamp_seconds gauge",
+        ]
+    )
+    for method, path, status in sorted(request_last_seen):
+        lines.append(
+            _labeled_metric_line(
+                "sage_server_http_request_last_seen_timestamp_seconds",
+                {"method": method, "path": path, "status": status},
+                request_last_seen[(method, path, status)],
             )
         )
 
@@ -417,6 +494,30 @@ def _render_operation_metrics() -> list[str]:
     return lines
 
 
+def _render_sse_failure_metrics() -> list[str]:
+    lines = [
+        "# HELP sage_server_sse_stream_failures_total SSE stream failures with session_id for drilldown.",
+        "# TYPE sage_server_sse_stream_failures_total counter",
+    ]
+    with _SSE_FAILURE_STATE.lock:
+        failures_total = dict(_SSE_FAILURE_STATE.failures_total)
+
+    for stream, session_id, trace_id, status in sorted(failures_total):
+        lines.append(
+            _labeled_metric_line(
+                "sage_server_sse_stream_failures_total",
+                {
+                    "stream": stream,
+                    "session_id": session_id,
+                    "trace_id": trace_id,
+                    "status": status,
+                },
+                failures_total[(stream, session_id, trace_id, status)],
+            )
+        )
+    return lines
+
+
 def render_prometheus_metrics() -> str:
     usage = resource.getrusage(resource.RUSAGE_SELF)
     proc_status = _parse_proc_status()
@@ -490,13 +591,18 @@ def render_prometheus_metrics() -> str:
         lines.extend(_metric_block(name, description, metric_type, value))
 
     for name, value in _load_average():
-        lines.extend(_metric_block(name, f"{name} from os.getloadavg().", "gauge", value))
+        lines.extend(
+            _metric_block(name, f"{name} from os.getloadavg().", "gauge", value)
+        )
 
     lines.extend(_render_python_metrics())
     lines.extend(_render_http_metrics())
     lines.extend(_render_operation_metrics())
+    lines.extend(_render_sse_failure_metrics())
     try:
-        from sagents.observability.prometheus_handler import render_prometheus_trace_metrics
+        from sagents.observability.prometheus_handler import (
+            render_prometheus_trace_metrics,
+        )
 
         lines.append(render_prometheus_trace_metrics().rstrip("\n"))
     except Exception:

@@ -50,6 +50,7 @@ dependencies = [
   "unstructured",
   "loguru>=0.7.0",
   "rank-bm25>=0.2.2",
+  "exceptiongroup>=1.2.0; python_version < '3.11'",
 ]
 
 [project.urls]
@@ -68,3 +69,16 @@ exclude = ["tests*", "app.desktop*", "app.skills*", "app.wiki*", "assets*", "log
 [tool.setuptools.data-files]
 "share/sage/docs/en" = ["docs/en/*.md"]
 "share/sage/docs/zh" = ["docs/zh/*.md"]
+
+[tool.setuptools.package-data]
+"app.terminal" = [
+  "bin/*/run-sage-terminal.sh",
+  "bin/*/run-sage-terminal.cmd",
+  "bin/*/sage-terminal",
+  "bin/*/sage-terminal.exe",
+  "bin/run-sage-terminal.sh",
+  "bin/run-sage-terminal.cmd",
+  "bin/sage-terminal",
+  "bin/sage-terminal.exe",
+  "scripts/run-sage-terminal.sh",
+]

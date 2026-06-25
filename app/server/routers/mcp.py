@@ -78,7 +78,8 @@ async def add(req: MCPServerRequest, http_request: Request):
     )
     return await Response.succ(
         data={"server_name": server_name, "status": "success"},
-        message=f"MCP server {req.name} 添加成功",
+        message="mcp.server_added",
+        message_params={"server_name": req.name},
     )
 
 
@@ -93,13 +94,13 @@ async def list(http_request: Request):
 
     user_id = get_request_user_id(http_request)
     role = get_request_role(http_request)
-    
+
     # Admin sees all (user_id=None), User sees own (user_id=user_id)
     target_user_id = None if role == "admin" else user_id
     mcp_servers = await mcp_service.list_mcp_servers(user_id=target_user_id)
     servers = [mcp_service.serialize_mcp_server(server) for server in mcp_servers]
     return await Response.succ(
-        data={"servers": servers}, message="获取MCP服务器列表成功"
+        data={"servers": servers}, message="mcp.server_list_loaded"
     )
 
 
@@ -130,7 +131,8 @@ async def update(server_name: str, req: MCPServerRequest, http_request: Request)
     )
     return await Response.succ(
         data={"server_name": server_name, "status": "success"},
-        message=f"MCP server {server_name} 更新成功",
+        message="mcp.server_updated",
+        message_params={"server_name": server_name},
     )
 
 
@@ -147,21 +149,24 @@ async def remove(server_name: str, http_request: Request):
     """
     user_id = get_request_user_id(http_request)
     role = get_request_role(http_request)
-    
+
     logger.info(f"开始删除MCP server: {server_name}")
     await mcp_service.remove_mcp_server(server_name, user_id, role)
     return await Response.succ(
-        data={"server_name": server_name}, message=f"MCP服务器 '{server_name}' 删除成功"
+        data={"server_name": server_name},
+        message="mcp.server_deleted",
+        message_params={"server_name": server_name},
     )
 
 
 @mcp_router.put("/{server_name}/toggle")
 async def toggle(server_name: str, http_request: Request):
     user_id = get_request_user_id(http_request)
-    disabled, status_text = await mcp_service.toggle_mcp_server(server_name, user_id)
+    disabled, _status_text = await mcp_service.toggle_mcp_server(server_name, user_id)
     return await Response.succ(
         data={"server_name": server_name, "disabled": disabled},
-        message=f"MCP服务器 '{server_name}' 已{status_text}",
+        message="mcp.server_disabled" if disabled else "mcp.server_enabled",
+        message_params={"server_name": server_name},
     )
 
 
@@ -178,7 +183,6 @@ async def refresh(server_name: str, http_request: Request):
     """
     user_id = get_request_user_id(http_request)
     role = get_request_role(http_request)
-
 
     status = await mcp_service.refresh_mcp_server(server_name, user_id, role)
     return await Response.succ(data={"server_name": server_name, "status": status})
@@ -197,14 +201,15 @@ async def preview(server_name: str, req: AnyToolPreviewRequest, http_request: Re
     )
     return await Response.succ(
         data=result,
-        message=f"AnyTool 预览执行成功: {req.tool_name}",
+        message="mcp.anytool_preview_success",
+        message_params={"tool_name": req.tool_name},
     )
 
 
 @mcp_router.post("/anytool/preview-draft")
 async def preview_draft(req: AnyToolDraftPreviewRequest, http_request: Request):
     user_id = get_request_user_id(http_request)
-    role = get_request_role(http_request)
+    get_request_role(http_request)
     result = await mcp_service.preview_anytool_draft(
         tool_definition=req.tool_definition,
         arguments=req.arguments,
@@ -214,7 +219,8 @@ async def preview_draft(req: AnyToolDraftPreviewRequest, http_request: Request):
     )
     return await Response.succ(
         data=result,
-        message=f"AnyTool 草稿预览执行成功: {req.tool_definition.get('name', '')}",
+        message="mcp.anytool_draft_preview_success",
+        message_params={"tool_name": req.tool_definition.get("name", "")},
     )
 
 
@@ -231,12 +237,15 @@ async def upsert_anytool_tool(req: AnyToolToolUpsertRequest, http_request: Reque
     )
     return await Response.succ(
         data=result,
-        message=f"AnyTool 工具保存成功: {req.tool_definition.get('name', '')}",
+        message="mcp.anytool_saved",
+        message_params={"tool_name": req.tool_definition.get("name", "")},
     )
 
 
 @mcp_router.delete("/anytool/tool/{tool_name}")
-async def delete_anytool_tool(tool_name: str, http_request: Request, server_name: Optional[str] = None):
+async def delete_anytool_tool(
+    tool_name: str, http_request: Request, server_name: Optional[str] = None
+):
     # 必须显式声明，否则会落到 mount 的 AnyToolStreamableHTTPApp 上。
     result = await mcp_service.delete_anytool_tool(
         tool_name=tool_name,
@@ -244,4 +253,8 @@ async def delete_anytool_tool(tool_name: str, http_request: Request, server_name
         user_id=get_request_user_id(http_request),
         role=get_request_role(http_request),
     )
-    return await Response.succ(data=result, message=f"AnyTool 工具已删除: {tool_name}")
+    return await Response.succ(
+        data=result,
+        message="mcp.anytool_deleted",
+        message_params={"tool_name": tool_name},
+    )

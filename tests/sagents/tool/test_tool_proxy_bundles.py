@@ -4,6 +4,7 @@
 - turn_status 在白名单模式下被自动注入；
 - {execute_shell_command, await_shell, kill_shell} 任意一个被勾选时三件套全部解锁。
 """
+
 from __future__ import annotations
 
 from sagents.tool.tool_base import tool
@@ -37,7 +38,7 @@ class _StubTurnStatus:
 
 class _StubToolExpansion:
     @tool()
-    def tool_expand_tools(self, tool_names: list[str] = None):
+    def tool_expand_tools(self, tool_names: list[str] = None):  # pyright: ignore[reportArgumentType]
         """expand"""
         return tool_names or []
 
@@ -83,3 +84,51 @@ def test_no_bundle_when_none_selected():
     assert "kill_shell" not in names
     # 但 turn_status 始终注入
     assert "turn_status" in names
+
+
+def test_complete_on_no_tool_call_mode_does_not_force_inject_turn_status(monkeypatch):
+    monkeypatch.setenv("SAGE_TASK_COMPLETION_MODE", "no_tool_call")
+
+    proxy = _build_proxy(available=["execute_shell_command"])
+    names = {t["name"] for t in proxy.list_tools()}
+    openai_names = {t["function"]["name"] for t in proxy.get_openai_tools()}
+
+    assert "turn_status" not in names
+    assert "turn_status" not in openai_names
+
+
+def test_llm_judge_mode_does_not_force_inject_turn_status(monkeypatch):
+    monkeypatch.setenv("SAGE_TASK_COMPLETION_MODE", "llm_judge")
+
+    proxy = _build_proxy(available=["execute_shell_command"])
+    names = {t["name"] for t in proxy.list_tools()}
+    openai_names = {t["function"]["name"] for t in proxy.get_openai_tools()}
+
+    assert "turn_status" not in names
+    assert "turn_status" not in openai_names
+
+
+def test_turn_status_mode_force_injects_turn_status(monkeypatch):
+    monkeypatch.setenv("SAGE_TASK_COMPLETION_MODE", "turn_status")
+
+    proxy = _build_proxy(available=["execute_shell_command"])
+    names = {t["name"] for t in proxy.list_tools()}
+
+    assert "turn_status" in names
+
+
+def test_complete_on_no_tool_call_mode_filters_turn_status_without_whitelist(
+    monkeypatch,
+):
+    monkeypatch.setenv("SAGE_TASK_COMPLETION_MODE", "no_tool_call")
+    tm = ToolManager(isolated=True, is_auto_discover=False)
+    tm.register_tools_from_object(_StubTurnStatus())
+    tm.register_tools_from_object(_StubShellTools())
+
+    proxy = ToolProxy(tool_managers=[tm])
+
+    assert "turn_status" not in {t["name"] for t in proxy.list_tools()}
+    assert "turn_status" not in {
+        t["function"]["name"] for t in proxy.get_openai_tools()
+    }
+    assert "turn_status" not in set(proxy.list_all_tools_name())

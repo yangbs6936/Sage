@@ -1,5 +1,6 @@
 use std::io;
 use std::io::ErrorKind;
+use std::io::Write;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -9,8 +10,8 @@ use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::style::ResetColor;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 
 use crate::app::{App, MessageKind, SubmitAction};
 use crate::backend::{BackendEvent, BackendHandle, BackendRequest};
@@ -19,7 +20,6 @@ use crate::history::insert_history_lines;
 use crate::terminal_layout::desired_viewport_height;
 use crate::terminal_support::sync_contextual_popup_data;
 use crate::ui;
-use crate::wrap::wrap_lines;
 
 mod actions;
 mod keys;
@@ -31,7 +31,7 @@ use keys::handle_key;
 
 pub type AppTerminal = Terminal<BackendImpl>;
 const INLINE_VIEWPORT_IDLE_HEIGHT: u16 = 5;
-const INLINE_VIEWPORT_MAX_HEIGHT: u16 = 14;
+const INLINE_VIEWPORT_MAX_HEIGHT: u16 = 18;
 // Keep keyboard enhancement mode minimal.
 //
 // `DISAMBIGUATE_ESCAPE_CODES` is enough to let capable terminals distinguish
@@ -39,43 +39,56 @@ const INLINE_VIEWPORT_MAX_HEIGHT: u16 = 14;
 // real-world IME regressions, especially for Chinese input methods.
 const KEYBOARD_ENHANCEMENT_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+const BUSY_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const IDLE_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub fn setup_terminal(_app: &App) -> Result<AppTerminal> {
-    let startup_cursor = cursor::position()
-        .ok()
-        .map(|(x, y)| ratatui::layout::Position { x, y });
     enable_raw_mode()?;
-    execute!(io::stdout(), EnableBracketedPaste)?;
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b[r\x1b[0m")?;
+    let cursor_position = ratatui::layout::Position { x: 0, y: 0 };
+    execute!(
+        stdout,
+        Clear(ClearType::All),
+        cursor::MoveTo(cursor_position.x, cursor_position.y)
+    )?;
+    execute!(stdout, EnableBracketedPaste)?;
     ignore_unsupported(execute!(
-        io::stdout(),
+        stdout,
         PushKeyboardEnhancementFlags(KEYBOARD_ENHANCEMENT_FLAGS)
     ))?;
-    let backend = BackendImpl::new(io::stdout());
-    Ok(match startup_cursor {
-        Some(position) => Terminal::with_viewport_height_and_cursor(
-            backend,
-            INLINE_VIEWPORT_IDLE_HEIGHT,
-            position,
-        )?,
-        None => Terminal::with_viewport_height(backend, INLINE_VIEWPORT_IDLE_HEIGHT)?,
-    })
+    stdout.flush()?;
+    let backend = BackendImpl::new(stdout);
+    let mut terminal = Terminal::with_viewport_height_and_cursor(
+        backend,
+        INLINE_VIEWPORT_IDLE_HEIGHT,
+        cursor_position,
+    )?;
+    terminal.clear()?;
+    Ok(terminal)
 }
 
 pub fn restore_terminal(terminal: &mut AppTerminal) -> Result<()> {
-    disable_raw_mode()?;
-    let viewport = terminal.viewport_area();
+    let mut first_error = terminal.clear_viewport_for_exit().err();
+    if let Err(err) = disable_raw_mode() {
+        first_error.get_or_insert(err);
+    }
     let backend = terminal.backend_mut();
-    ignore_unsupported(execute!(
+    if let Err(err) = ignore_unsupported(execute!(backend, PopKeyboardEnhancementFlags)) {
+        first_error.get_or_insert(err);
+    }
+    if let Err(err) = execute!(
         backend,
-        PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
-        crossterm::style::ResetColor,
-        crossterm::cursor::Show,
-        crossterm::cursor::MoveTo(0, viewport.y),
-        Clear(ClearType::FromCursorDown),
-        crossterm::cursor::MoveTo(0, viewport.y)
-    ))?;
-    Ok(())
+        ResetColor,
+        crossterm::cursor::Show
+    ) {
+        first_error.get_or_insert(err);
+    }
+    match first_error {
+        Some(err) => Err(err.into()),
+        None => Ok(()),
+    }
 }
 
 pub fn run(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
@@ -104,19 +117,25 @@ pub fn run_with_startup_action(
             stop_backend(backend.take());
         }
 
-        let width = terminal.size()?.width.max(1);
+        let screen_size = terminal.size()?;
+        let width = screen_size.width.max(1);
         app.materialize_pending_ui(width);
+        if app.take_clear_request() {
+            terminal.clear()?;
+            dirty = true;
+        }
+        dirty |= drain_backend(app, &mut backend);
+
         let elapsed_tick = app.live_elapsed_seconds();
         if elapsed_tick != last_elapsed_tick {
             dirty = true;
             last_elapsed_tick = elapsed_tick;
         }
-
         let desired_height = desired_viewport_height(
             app,
             width,
             INLINE_VIEWPORT_IDLE_HEIGHT,
-            INLINE_VIEWPORT_MAX_HEIGHT,
+            INLINE_VIEWPORT_MAX_HEIGHT.min(screen_size.height.max(1)),
         );
         if desired_height != viewport_height {
             terminal.set_viewport_height(desired_height)?;
@@ -125,7 +144,6 @@ pub fn run_with_startup_action(
             dirty = true;
         }
 
-        dirty |= drain_backend(app, &mut backend);
         dirty |= flush_history(terminal, app)?;
         if dirty {
             terminal.draw(|frame| ui::render(frame, app))?;
@@ -136,13 +154,16 @@ pub fn run_with_startup_action(
             break;
         }
 
-        if event::poll(Duration::from_millis(16))? {
+        if event::poll(event_poll_interval(app, backend.is_some()))? {
             match event::read()? {
                 Event::Key(key) if should_handle_key_event(key.kind) => {
                     dirty |= handle_key(app, key, &mut backend)?
                 }
                 Event::Paste(text) => {
-                    if !app.is_help_overlay_visible() && !app.is_session_picker_visible() {
+                    if matches!(
+                        app.active_surface_kind(),
+                        None | Some(crate::app::ActiveSurfaceKind::Popup)
+                    ) {
                         app.insert_text(&text);
                         sync_contextual_popup_data(app);
                         dirty = true;
@@ -181,8 +202,7 @@ fn drain_backend(app: &mut App, backend: &mut Option<BackendHandle>) -> bool {
                 BackendEvent::Message(kind, message) => {
                     if app.busy
                         && matches!(kind, MessageKind::Process | MessageKind::System)
-                        && (message.starts_with("[working]")
-                            || message.starts_with("backend ·"))
+                        && (message.starts_with("[working]") || message.starts_with("backend ·"))
                     {
                         app.set_live_notice(kind, &message);
                     } else {
@@ -196,10 +216,15 @@ fn drain_backend(app: &mut App, backend: &mut Option<BackendHandle>) -> bool {
                 BackendEvent::Stats(stats) => app.apply_backend_stats(stats),
                 BackendEvent::Error(message) => app.fail_request(message),
                 BackendEvent::Finished => {
-                    app.complete_request();
+                    if app.busy {
+                        app.complete_request();
+                    }
                 }
                 BackendEvent::Exited => {
                     backend.take();
+                    if app.busy {
+                        app.fail_request("backend process exited before completing request");
+                    }
                     break;
                 }
             }
@@ -214,9 +239,17 @@ fn flush_history(terminal: &mut AppTerminal, app: &mut App) -> Result<bool> {
     if lines.is_empty() {
         return Ok(false);
     }
-    let wrapped = wrap_lines(&lines, terminal.size()?.width.max(1));
-    insert_history_lines(terminal, &wrapped)?;
+    insert_history_lines(terminal, &lines)?;
+    terminal.invalidate_viewport();
     Ok(true)
+}
+
+fn event_poll_interval(app: &App, backend_active: bool) -> Duration {
+    if app.busy || backend_active {
+        BUSY_EVENT_POLL_INTERVAL
+    } else {
+        IDLE_EVENT_POLL_INTERVAL
+    }
 }
 
 fn ensure_backend<'a>(

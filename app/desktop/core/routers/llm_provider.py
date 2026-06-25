@@ -7,6 +7,7 @@ from ..user_context import get_desktop_user_id
 
 router = APIRouter(prefix="/api/llm-provider", tags=["LLM Provider"])
 
+
 @router.post("/verify")
 async def verify_provider(data: LLMProviderCreate):
     """
@@ -14,9 +15,12 @@ async def verify_provider(data: LLMProviderCreate):
     """
     try:
         await llm_provider_service.verify_provider(data)
-        return await Response.succ(message="验证成功")
+        return await Response.succ(message="llm_provider.verify_success")
     except Exception as e:
-        return await Response.error(message=f"验证失败: {str(e)}")
+        return await Response.error(
+            message="llm_provider.verify_failed",
+            message_params={"message": str(e)},
+        )
 
 
 @router.post("/verify-capabilities")
@@ -26,9 +30,14 @@ async def verify_capabilities(data: LLMProviderCreate):
     """
     try:
         result = await llm_provider_service.verify_capabilities(data)
-        return await Response.succ(message="能力验证成功", data=result)
+        return await Response.succ(
+            message="llm_provider.capabilities_success", data=result
+        )
     except Exception as e:
-        return await Response.error(message=f"验证失败: {str(e)}")
+        return await Response.error(
+            message="llm_provider.verify_failed",
+            message_params={"message": str(e)},
+        )
 
 
 @router.post("/verify-multimodal")
@@ -40,18 +49,27 @@ async def verify_multimodal(data: LLMProviderCreate):
     try:
         result = await llm_provider_service.verify_multimodal(data)
         if not result["supports_multimodal"]:
-            return await Response.succ(message="该模型不支持多模态", data=result)
+            return await Response.succ(
+                message="llm_provider.multimodal_not_supported", data=result
+            )
         return await Response.succ(
-            message="多模态验证成功，模型正确识别了图片内容" if result["recognized"] else "模型支持多模态但未能正确识别图片内容",
+            message="llm_provider.multimodal_recognized"
+            if result["recognized"]
+            else "llm_provider.multimodal_unrecognized",
             data=result,
         )
     except Exception as e:
-        return await Response.succ(message="该模型不支持多模态", data={"supports_multimodal": False, "error": str(e)})
+        return await Response.succ(
+            message="llm_provider.multimodal_not_supported",
+            data={"supports_multimodal": False, "error": str(e)},
+        )
+
 
 @router.get("/list")
 async def list_providers(request: Request):
     user_id = get_desktop_user_id(request)
     return await Response.succ(data=await llm_provider_service.list_providers(user_id))
+
 
 @router.post("/create")
 async def create_provider(data: LLMProviderCreate, request: Request):
@@ -60,10 +78,14 @@ async def create_provider(data: LLMProviderCreate, request: Request):
         provider_id = await llm_provider_service.create_provider(data, user_id=user_id)
         if data.is_default:
             providers = await llm_provider_service.list_providers(user_id)
-            provider = next((item for item in providers if item.get("id") == provider_id), None)
+            provider = next(
+                (item for item in providers if item.get("id") == provider_id), None
+            )
             if provider:
                 chat_client = await init_chat_client(
-                    api_key=provider["api_keys"][0] if provider.get("api_keys") else None,
+                    api_key=provider["api_keys"][0]
+                    if provider.get("api_keys")
+                    else None,
                     base_url=provider.get("base_url"),
                     model_name=provider.get("model"),
                 )
@@ -72,6 +94,7 @@ async def create_provider(data: LLMProviderCreate, request: Request):
         return await Response.succ(data={"provider_id": provider_id})
     except ValueError as e:
         return await Response.error(message=str(e))
+
 
 @router.put("/update/{provider_id}")
 async def update_provider(provider_id: str, data: LLMProviderUpdate, request: Request):
@@ -88,6 +111,7 @@ async def update_provider(provider_id: str, data: LLMProviderUpdate, request: Re
         return await Response.error(message=str(e))
     except ValueError as e:
         return await Response.error(message=str(e))
+
 
 @router.delete("/delete/{provider_id}")
 async def delete_provider(provider_id: str, request: Request):

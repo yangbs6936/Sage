@@ -15,7 +15,9 @@ from ..services.browser_bridge import BrowserBridgeHub
 from ..user_context import get_desktop_user_id
 
 
-browser_extension_router = APIRouter(prefix="/api/browser-extension", tags=["Browser Extension"])
+browser_extension_router = APIRouter(
+    prefix="/api/browser-extension", tags=["Browser Extension"]
+)
 
 
 class ExtensionHeartbeatRequest(BaseModel):
@@ -41,7 +43,7 @@ class CommandResultRequest(BaseModel):
 async def extension_status(http_request: Request):
     user_id = get_desktop_user_id(http_request)
     return await Response.succ(
-        message="浏览器插件状态获取成功",
+        message="browser.status_loaded",
         data=await get_browser_tool_sync_state(user_id),
     )
 
@@ -54,7 +56,7 @@ async def extension_probe(
     """主动 ping 浏览器扩展。超时即强制标记离线，便于前端立刻刷新。"""
     user_id = get_desktop_user_id(http_request)
     return await Response.succ(
-        message="浏览器插件探活完成",
+        message="browser.probe_done",
         data=await probe_extension(user_id, timeout_seconds=timeout),
     )
 
@@ -73,15 +75,17 @@ async def extension_heartbeat(req: ExtensionHeartbeatRequest, http_request: Requ
     )
     get_browser_capability_coordinator().notify_activity()
     data = await get_browser_tool_sync_state(user_id)
-    return await Response.succ(message="浏览器插件心跳已更新", data=data)
+    return await Response.succ(message="browser.heartbeat_updated", data=data)
 
 
 @browser_extension_router.post("/commands")
 async def create_command(req: CommandCreateRequest, http_request: Request):
     user_id = get_desktop_user_id(http_request)
     hub = BrowserBridgeHub.get_instance()
-    command = await hub.enqueue_command(user_id=user_id, action=req.action, args=req.args or {})
-    return await Response.succ(message="浏览器命令已创建", data=command)
+    command = await hub.enqueue_command(
+        user_id=user_id, action=req.action, args=req.args or {}
+    )
+    return await Response.succ(message="browser.command_created", data=command)
 
 
 @browser_extension_router.get("/commands/poll")
@@ -93,13 +97,15 @@ async def poll_command(
     hub = BrowserBridgeHub.get_instance()
     command = await hub.poll_command(user_id=user_id, timeout_seconds=timeout)
     return await Response.succ(
-        message="浏览器命令轮询成功",
+        message="browser.command_poll_success",
         data={"command": command},
     )
 
 
 @browser_extension_router.post("/commands/{command_id}/result")
-async def submit_command_result(command_id: str, req: CommandResultRequest, http_request: Request):
+async def submit_command_result(
+    command_id: str, req: CommandResultRequest, http_request: Request
+):
     user_id = get_desktop_user_id(http_request)
     hub = BrowserBridgeHub.get_instance()
     result = await hub.submit_command_result(
@@ -109,7 +115,7 @@ async def submit_command_result(command_id: str, req: CommandResultRequest, http
         result=req.result,
         error=req.error,
     )
-    return await Response.succ(message="浏览器命令结果已回传", data=result)
+    return await Response.succ(message="browser.command_result_submitted", data=result)
 
 
 @browser_extension_router.get("/commands/{command_id}/result")
@@ -118,8 +124,10 @@ async def wait_command_result(
     timeout: float = Query(default=30.0, ge=0.0, le=180.0),
 ):
     hub = BrowserBridgeHub.get_instance()
-    result = await hub.wait_command_result(command_id=command_id, timeout_seconds=timeout)
+    result = await hub.wait_command_result(
+        command_id=command_id, timeout_seconds=timeout
+    )
     return await Response.succ(
-        message="浏览器命令结果获取成功",
+        message="browser.command_result_loaded",
         data={"done": result is not None, "result": result},
     )

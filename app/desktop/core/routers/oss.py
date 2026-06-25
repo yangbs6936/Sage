@@ -9,7 +9,10 @@ from fastapi.responses import FileResponse
 from common.utils.file import split_file_name
 from PIL import Image
 from loguru import logger
-from common.utils.safe_remote_fetch import SafeRemoteFetchError, fetch_http_url_bytes_bounded
+from common.utils.safe_remote_fetch import (
+    SafeRemoteFetchError,
+    fetch_http_url_bytes_bounded,
+)
 
 oss_router = APIRouter(prefix="/api/oss", tags=["OSS"])
 
@@ -22,6 +25,7 @@ class OssImportBody(BaseModel):
 class OssSandboxUploadBody(BaseModel):
     agent_id: str = Field(..., min_length=1, max_length=240)
     filename: str = Field(..., min_length=1, max_length=480)
+
 
 def _resolve_upload_root(agent_id: Optional[str]) -> Path:
     """根据 agent_id 解析上传文件根目录。"""
@@ -38,7 +42,12 @@ def _build_public_url(request: Request, agent_id: Optional[str], filename: str) 
         return f"{base}/api/oss/file/{agent_id}/{filename}"
     return f"{base}/api/oss/file/_default/{filename}"
 
-def compress_image_to_target_size(image: Image.Image, target_size_bytes: int = 1 * 1024 * 1024, max_dimension: int = 2048) -> bytes:
+
+def compress_image_to_target_size(
+    image: Image.Image,
+    target_size_bytes: int = 1 * 1024 * 1024,
+    max_dimension: int = 2048,
+) -> bytes:
     """Compress image to target size (default 1MB) while maintaining aspect ratio."""
     # Resize if image is too large
     width, height = image.size
@@ -47,57 +56,69 @@ def compress_image_to_target_size(image: Image.Image, target_size_bytes: int = 1
         new_width = int(width * ratio)
         new_height = int(height * ratio)
         image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-    
+
     # Try different quality levels to achieve target size
     quality = 95
     min_quality = 30
-    
+
     while quality >= min_quality:
         buffer = io.BytesIO()
         # Convert to RGB if necessary (for PNG with transparency)
-        if image.mode in ('RGBA', 'LA', 'P'):
-            background = Image.new('RGB', image.size, (255, 255, 255))
-            if image.mode == 'P':
-                image = image.convert('RGBA')
-            if image.mode in ('RGBA', 'LA'):
-                background.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
+        if image.mode in ("RGBA", "LA", "P"):
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            if image.mode == "P":
+                image = image.convert("RGBA")
+            if image.mode in ("RGBA", "LA"):
+                background.paste(
+                    image,
+                    mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None,
+                )
                 image = background
             else:
-                image = image.convert('RGB')
-        
-        image.save(buffer, format='JPEG', quality=quality, optimize=True)
+                image = image.convert("RGB")
+
+        image.save(buffer, format="JPEG", quality=quality, optimize=True)
         size = buffer.tell()
-        
+
         if size <= target_size_bytes:
             return buffer.getvalue()
-        
+
         # Reduce quality and try again
         quality -= 5
-    
+
     # If still too large, reduce dimensions further
     ratio = 0.8
     while True:
         new_width = int(width * ratio)
         new_height = int(height * ratio)
         resized = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
+
         buffer = io.BytesIO()
-        resized.save(buffer, format='JPEG', quality=min_quality, optimize=True)
+        resized.save(buffer, format="JPEG", quality=min_quality, optimize=True)
         size = buffer.tell()
-        
+
         if size <= target_size_bytes:
             return buffer.getvalue()
-        
+
         ratio *= 0.8
         if ratio < 0.1:  # Prevent infinite loop
             break
-    
+
     return buffer.getvalue()
 
 
 def is_image_file(filename: str) -> bool:
     """Check if file is an image based on extension."""
-    image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+    image_extensions = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".bmp",
+        ".webp",
+        ".tiff",
+        ".tif",
+    }
     ext = os.path.splitext(filename.lower())[1]
     return ext in image_extensions
 
@@ -120,9 +141,13 @@ def _persist_upload_bytes(
 
     if is_image_file(fn):
         try:
-            logger.info(f"Original file size (import/upload): {len(content)} bytes, start compress")
+            logger.info(
+                f"Original file size (import/upload): {len(content)} bytes, start compress"
+            )
             image = Image.open(io.BytesIO(content))
-            compressed_data = compress_image_to_target_size(image, target_size_bytes=1 * 1024 * 1024)
+            compressed_data = compress_image_to_target_size(
+                image, target_size_bytes=1 * 1024 * 1024
+            )
             ext = ".jpg"
             final_filename = f"{origin}_{timestamp}{ext}"
             file_path = sage_files_dir / final_filename
@@ -183,6 +208,7 @@ async def upload_file(
         )
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -201,6 +227,7 @@ async def import_url(request: Request, body: OssImportBody):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -211,21 +238,21 @@ async def import_sandbox_upload(request: Request, body: OssSandboxUploadBody):
     aid = body.agent_id.strip()
     fn = body.filename.strip()
     if not aid:
-        raise HTTPException(status_code=400, detail="invalid agent_id")
+        raise HTTPException(status_code=400, detail="oss.invalid_agent_id")
     if ".." in aid or "/" in aid or "\\" in aid:
-        raise HTTPException(status_code=400, detail="invalid agent_id")
+        raise HTTPException(status_code=400, detail="oss.invalid_agent_id")
     if ".." in fn or "/" in fn or "\\" in fn:
-        raise HTTPException(status_code=400, detail="invalid filename")
+        raise HTTPException(status_code=400, detail="oss.invalid_filename")
 
     base = _resolve_upload_root(aid).resolve()
     file_path = (base / fn).resolve()
     try:
         file_path.relative_to(base)
     except ValueError:
-        raise HTTPException(status_code=400, detail="path traversal not allowed")
+        raise HTTPException(status_code=400, detail="oss.path_traversal_not_allowed")
 
     if not file_path.exists() or not file_path.is_file():
-        raise HTTPException(status_code=404, detail="file not found")
+        raise HTTPException(status_code=404, detail="oss.file_missing_or_unreadable")
 
     local_path = str(file_path)
     public_url = _build_public_url(request, aid, fn)
@@ -246,22 +273,22 @@ async def serve_uploaded_file(agent_id: str, filename: str):
     完全一致（前端不再需要 Tauri convertFileSrc / readFile 这条本地路径分支）。
     """
     if "/" in filename or "\\" in filename or filename in ("..", "."):
-        raise HTTPException(status_code=400, detail="invalid filename")
+        raise HTTPException(status_code=400, detail="oss.invalid_filename")
 
     if agent_id == "_default":
         base_dir = _resolve_upload_root(None)
     else:
         if "/" in agent_id or "\\" in agent_id or agent_id in ("..", "."):
-            raise HTTPException(status_code=400, detail="invalid agent_id")
+            raise HTTPException(status_code=400, detail="oss.invalid_agent_id")
         base_dir = _resolve_upload_root(agent_id)
 
     file_path = (base_dir / filename).resolve()
     try:
         file_path.relative_to(base_dir.resolve())
     except ValueError:
-        raise HTTPException(status_code=400, detail="path traversal not allowed")
+        raise HTTPException(status_code=400, detail="oss.path_traversal_not_allowed")
 
     if not file_path.exists() or not file_path.is_file():
-        raise HTTPException(status_code=404, detail="file not found")
+        raise HTTPException(status_code=404, detail="oss.file_missing_or_unreadable")
 
     return FileResponse(str(file_path), filename=filename)

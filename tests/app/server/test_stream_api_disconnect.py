@@ -49,9 +49,7 @@ def _patch_chat_module(monkeypatch):
     """统一 patch chat router 模块里的副作用入口，返回一组 mock 供断言。"""
     interrupt_mock = AsyncMock()
     safe_release_mock = AsyncMock(return_value=True)
-    delete_lock_mock = monkeypatch.setattr(
-        chat_module, "delete_session_run_lock", lambda session_id: None
-    )
+    monkeypatch.setattr(chat_module, "delete_session_run_lock", lambda session_id: None)
 
     monkeypatch.setattr(
         chat_module.conversation_service, "interrupt_session", interrupt_mock
@@ -69,7 +67,9 @@ def _patch_chat_module(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_disconnect_breaks_loop_without_raising_generator_exit(_patch_chat_module):
+async def test_disconnect_breaks_loop_without_raising_generator_exit(
+    _patch_chat_module,
+):
     """断开后正常 break；不应有 GeneratorExit 泄漏到调用方，
     interrupt_session 应被调用一次，资源应被释放。"""
     # 让 is_disconnected 第 1 次就返回 True（迭代第一个 chunk 后立即触发）
@@ -78,7 +78,10 @@ async def test_disconnect_breaks_loop_without_raising_generator_exit(_patch_chat
 
     chunks = []
     gen = chat_module.stream_api_with_disconnect_check(
-        _normal_generator(5), request, lock, "session-disconnect-1"
+        _normal_generator(5),
+        request,  # pyright: ignore[reportArgumentType]
+        lock,
+        "session-disconnect-1",  # pyright: ignore[reportArgumentType]
     )
     # 直接消费完，不应抛任何异常
     async for ch in gen:
@@ -98,7 +101,10 @@ async def test_disconnect_yields_chunks_before_break(_patch_chat_module):
 
     chunks = []
     async for ch in chat_module.stream_api_with_disconnect_check(
-        _normal_generator(10), request, lock, "session-disconnect-2"
+        _normal_generator(10),
+        request,  # pyright: ignore[reportArgumentType]
+        lock,
+        "session-disconnect-2",  # pyright: ignore[reportArgumentType]
     ):
         chunks.append(ch)
 
@@ -107,7 +113,9 @@ async def test_disconnect_yields_chunks_before_break(_patch_chat_module):
 
 
 @pytest.mark.asyncio
-async def test_interrupt_session_timeout_does_not_block_cleanup(monkeypatch, _patch_chat_module):
+async def test_interrupt_session_timeout_does_not_block_cleanup(
+    monkeypatch, _patch_chat_module
+):
     """interrupt_session 卡死时应在超时后跳过，aclose / safe_release 仍要执行。"""
 
     async def _hanging_interrupt(*args, **kwargs):
@@ -122,14 +130,46 @@ async def test_interrupt_session_timeout_does_not_block_cleanup(monkeypatch, _pa
 
     start = asyncio.get_event_loop().time()
     async for _ in chat_module.stream_api_with_disconnect_check(
-        _normal_generator(5), request, lock, "session-interrupt-hang"
+        _normal_generator(5),
+        request,  # pyright: ignore[reportArgumentType]
+        lock,
+        "session-interrupt-hang",  # pyright: ignore[reportArgumentType]
     ):
         pass
     elapsed = asyncio.get_event_loop().time() - start
 
     # 应在 interrupt 超时（100ms）附近完成，远小于 pytest 2s timeout。
-    assert elapsed < 1.0, f"interrupt_session 卡死时清理未及时返回，elapsed={elapsed:.3f}s"
+    assert elapsed < 1.0, (
+        f"interrupt_session 卡死时清理未及时返回，elapsed={elapsed:.3f}s"
+    )
     # 资源释放路径仍要被走到。
+    _patch_chat_module.safe_release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_cancel_does_not_skip_lock_release(
+    monkeypatch, _patch_chat_module
+):
+    """interrupt 持久化被取消时，仍要继续释放会话锁。"""
+
+    async def _cancelled_interrupt(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        chat_module.conversation_service, "interrupt_session", _cancelled_interrupt
+    )
+
+    request = _FakeRequest(disconnect_at=0)
+    lock = asyncio.Lock()
+
+    async for _ in chat_module.stream_api_with_disconnect_check(
+        _normal_generator(5),
+        request,  # pyright: ignore[reportArgumentType]
+        lock,
+        "session-interrupt-cancel",  # pyright: ignore[reportArgumentType]
+    ):
+        pass
+
     _patch_chat_module.safe_release.assert_awaited_once()
 
 
@@ -141,11 +181,48 @@ async def test_generator_aclose_timeout_does_not_block_cleanup(_patch_chat_modul
 
     start = asyncio.get_event_loop().time()
     async for _ in chat_module.stream_api_with_disconnect_check(
-        _generator_with_hanging_aclose(), request, lock, "session-aclose-hang"
+        _generator_with_hanging_aclose(),
+        request,  # pyright: ignore[reportArgumentType]
+        lock,
+        "session-aclose-hang",  # pyright: ignore[reportArgumentType]
     ):
         pass
     elapsed = asyncio.get_event_loop().time() - start
 
     # 两个超时窗口都 100ms，且 interrupt mock 立即返回，总耗时应在 ~100ms 附近。
     assert elapsed < 1.0, f"aclose 卡死时清理未及时返回，elapsed={elapsed:.3f}s"
+    _patch_chat_module.safe_release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_generator_aclose_cancel_does_not_skip_lock_release(_patch_chat_module):
+    """generator.aclose() 被取消时，仍要继续释放会话锁。"""
+
+    class _GeneratorWithCancelledAclose:
+        def __init__(self):
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._sent:
+                raise StopAsyncIteration
+            self._sent = True
+            return "chunk-0\n"
+
+        async def aclose(self):
+            raise asyncio.CancelledError()
+
+    request = _FakeRequest(disconnect_at=0)
+    lock = asyncio.Lock()
+
+    async for _ in chat_module.stream_api_with_disconnect_check(
+        _GeneratorWithCancelledAclose(),
+        request,  # pyright: ignore[reportArgumentType]
+        lock,
+        "session-aclose-cancel",  # pyright: ignore[reportArgumentType]
+    ):
+        pass
+
     _patch_chat_module.safe_release.assert_awaited_once()
